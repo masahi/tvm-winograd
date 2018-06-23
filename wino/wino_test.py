@@ -49,17 +49,17 @@ def const_array(data, name):
         return now
     return tvm.compute(data.shape, select_array, name=name)
 
-def decl_winograd(data, kernel, stride, padding, out_dtype):
+def decl_winograd(data, U, stride, padding, out_dtype):
     """declare winograd fast convolution F(2x2, 3x3) for conv2d"""
     N, CI, H, W = [util.get_const_int(x) for x in data.shape]
-    CO, CI, KH, KW = [util.get_const_int(x) for x in kernel.shape]
-    HPAD, WPAD, _, _ = get_pad_tuple(padding, kernel)
+    _, _, CO, CI = [util.get_const_int(x) for x in U.shape]
+    HPAD, WPAD = 1,1
     if isinstance(stride, (tuple, list)):
         HSTR, WSTR = stride
     else:
         HSTR, WSTR = stride, stride
 
-    assert HSTR == 1 and WSTR == 1 and HPAD == 1 and WPAD == 1 and KH == 3 and KW == 3
+    assert HSTR == 1 and WSTR == 1 and HPAD == 1 and WPAD == 1
     data_pad = pad(data, (0, 0, HPAD, WPAD), name="data_pad")
 
     B_data = np.array([
@@ -67,13 +67,6 @@ def decl_winograd(data, kernel, stride, padding, out_dtype):
         [0, 1, -1, 1],
         [-1, 1, 1, 0],
         [0, 0, 0, -1]
-    ], out_dtype)
-
-    G_data = np.array([
-        [1, 0, 0],
-        [1.0/2, 1.0/2, 1.0/2],
-        [1.0/2, -1.0/2, 1.0/2],
-        [0, 0, 1],
     ], out_dtype)
 
     A_data = np.array([
@@ -102,15 +95,7 @@ def decl_winograd(data, kernel, stride, padding, out_dtype):
     # pack input tile
     input_tile = tvm.compute((C, P_round, alpha, alpha),
                              lambda c, b, eps, nu:
-                             tvm.select(b < P,  data_pad[b // (nH*nW)][c][b// nW % nH * m + eps][b % nW * m + nu], tvm.const(0, data_pad.dtype)), name='d')
-
-    # transform kernel
-    G = const_array(G_data, 'G')
-    r_kh = tvm.reduce_axis((0, KH), 'r_kh')
-    r_kw = tvm.reduce_axis((0, KW), 'r_kw')
-    U = tvm.compute((alpha, alpha, K, C), lambda eps, nu, k, c:
-                    tvm.sum(kernel[k][c][r_kh][r_kw] * G[eps][r_kh] * G[nu][r_kw],
-                            axis=[r_kh, r_kw]), name='U')
+                             tvm.select(b < P, data_pad[b // (nH*nW)][c][b// nW % nH * m + eps][b % nW * m + nu], tvm.const(0, data_pad.dtype)), name='d')
 
     # transform image
     B = const_array(B_data, 'B')
@@ -136,10 +121,7 @@ def decl_winograd(data, kernel, stride, padding, out_dtype):
 
     # unpack output
     output = tvm.compute((N, K, H, W), lambda n, k, h, w:
-                         Y[k][n * nH * nW + (h//m) * nW + w//m][h % m][w % m]
-                         # thw following term is used to make the padding effective,
-                         # otherwise the padding will be eliminated by bound inference
-                         + tvm.const(0, out_dtype) * M[alpha-1][alpha-1][K-1][P_round-1],
+                         Y[k][n * nH * nW + (h//m) * nW + w//m][h % m][w % m],
                          name='output', tag='winograd_conv_output')
 
     return output
@@ -150,34 +132,16 @@ def schedule_winograd(s, op):
     Y = op.input_tensors[0]
     M, A = s[Y].op.input_tensors
     U, V = s[M].op.input_tensors
-    kernel, G = s[U].op.input_tensors
     d, B = s[V].op.input_tensors
     data_pad = s[d].op.input_tensors[0]
     data = s[data_pad].op.input_tensors[0]
 
-    # dilation
-    if isinstance(kernel.op, tvm.tensor.ComputeOp) and "dilate" in kernel.op.tag:
-        s[kernel].compute_inline()
-
-    # padding
     s[data_pad].compute_inline()
-
-    # pack input tiles
-    c, b, eps, nu = s[d].op.axis
-    s[d].reorder(eps, nu)
-    aha = s[d].fuse(eps, nu)
-    tile_and_bind3d(s, d, c, b, aha, 4, 1, 1)
-
-    # transform kernel
-    s[G].compute_inline()
-    eps, nu, k, c= s[U].op.axis
-    r_kh, r_kw = s[U].op.reduce_axis
-    s[U].reorder(k, c, eps, nu, r_kh, r_kw)
-    _ = [s[U].unroll(x) for x in [eps, nu, r_kh, r_kw]]
-    tile_and_bind(s, U, k, c, 1, 256)
+    s[d].compute_inline()
 
     # transform image
     s[B].compute_inline()
+    #s[V].compute_inline()
     eps, nu, b, c= s[V].op.axis
     r_eps, r_nu = s[V].op.reduce_axis
     s[V].reorder(b, c, eps, nu, r_nu, r_eps)
@@ -198,9 +162,11 @@ def schedule_winograd(s, op):
     s[M].unroll(yi)
     z = s[M].fuse(eps, nu)
     tile_and_bind3d(s, M, z, yo, xo, 1, 8, 1)
+    #s[M].compute_inline()
 
     # inverse transform
     s[A].compute_inline()
+#    s[Y].compute_inline()
     k, b, vh, vw = s[Y].op.axis
     r_eps, r_nu = s[Y].op.reduce_axis
     _ = [s[Y].unroll(x) for x in [vh, vw, r_eps, r_nu]]
@@ -232,11 +198,28 @@ def schedule_conv2d_nchw(outs):
     traverse(outs[0].op)
     return s
 
+def transform_filter(w_np):
+    num_filter, in_channel, kernel, kernel = w_np.shape
+    G = np.array([
+        [1, 0, 0],
+        [1.0/2, 1.0/2, 1.0/2],
+        [1.0/2, -1.0/2, 1.0/2],
+        [0, 0, 1],
+    ], w_np.dtype)
+
+    out = np.empty((4, 4, num_filter, in_channel), w_np.dtype)
+    for i in range(num_filter):
+        for j in range(in_channel):
+            out[:, :, i, j] = np.dot(G, np.dot(w_np[i, j], G.transpose()))
+    return out
+
+
 def test(batch, in_channel, in_size, num_filter, kernel, stride, padding, dilation=1):
     in_height = in_width = in_size
 
     A = tvm.placeholder((batch, in_channel, in_height, in_width), name='A')
     W = tvm.placeholder((num_filter, in_channel, kernel, kernel), name='W')
+    U = tvm.placeholder((4, 4, num_filter, in_channel), name='W')
 
     a_shape = get_const_tuple(A.shape)
     w_shape = get_const_tuple(W.shape)
@@ -255,20 +238,24 @@ def test(batch, in_channel, in_size, num_filter, kernel, stride, padding, dilati
 
     device = "cuda"
     with tvm.target.create(device):
-        B = decl_winograd(A, W, stride, padding, dtype)
+        B = decl_winograd(A, U, stride, padding, dtype)
         s = schedule_conv2d_nchw([B])
+
+    u_np = transform_filter(w_np)
 
     ctx = tvm.context(device, 0)
     a = tvm.nd.array(a_np, ctx)
-    w = tvm.nd.array(w_np, ctx)
+    u = tvm.nd.array(u_np, ctx)
     b = tvm.nd.array(np.zeros(get_const_tuple(B.shape), dtype=B.dtype), ctx)
     with tvm.build_config(auto_unroll_max_step=1400,
                           unroll_explicit=(device != "cuda")):
-        func = tvm.build(s, [A, W, B], device)
-        func(a, w, b)
+        func = tvm.build(s, [A, U, B], device)
+        print(tvm.lower(s, [A, U, B], simple_mode=True))
+        func(a, u, b)
         #print(func.imported_modules[0].get_source())
         np.testing.assert_allclose(b.asnumpy(), b_np, rtol=1e-5)
         print(np.mean(np.abs(b.asnumpy() - b_np)))
 
 
 test(1, 128, 122, 128, 3, 1, 1)
+test(1, 64, 64, 32, 3, 1, 1)
