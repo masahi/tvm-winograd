@@ -98,35 +98,33 @@ def decl_winograd(data, kernel, stride, padding, out_dtype):
     P_round = (P + bnb - 1) // bnb * bnb
     assert K % bna == 0 and P_round % bnb == 0
 
+    print(data_pad.shape)
     # pack input tile
-    input_tile = tvm.compute((C, P_round // bnb, alpha, alpha, bnb),
-                             lambda c, b, eps, nu, bb:
-                             tvm.select(b * bnb + bb < P,\
-                             data_pad[(b*bnb+bb) // (nH*nW)][c][(b*bnb+bb) // nW % nH * m + eps]\
-                             [(b*bnb+bb) % nW * m + nu], tvm.const(0, data_pad.dtype)),
-                             name='d')
+    input_tile = tvm.compute((C, P_round, alpha, alpha),
+                             lambda c, b, eps, nu:
+                             tvm.select(b < P,  data_pad[b // (nH*nW)][c][b// nW % nH * m + eps][b % nW * m + nu], tvm.const(0, data_pad.dtype)), name='d')
 
     # transform kernel
     G = const_array(G_data, 'G')
     r_kh = tvm.reduce_axis((0, KH), 'r_kh')
     r_kw = tvm.reduce_axis((0, KW), 'r_kw')
-    U = tvm.compute((alpha, alpha, K // bna, C, bna), lambda eps, nu, k, c, kk:
-                    tvm.sum(kernel[k * bna + kk][c][r_kh][r_kw] * G[eps][r_kh] * G[nu][r_kw],
+    U = tvm.compute((alpha, alpha, K, C), lambda eps, nu, k, c:
+                    tvm.sum(kernel[k][c][r_kh][r_kw] * G[eps][r_kh] * G[nu][r_kw],
                             axis=[r_kh, r_kw]), name='U')
 
     # transform image
     B = const_array(B_data, 'B')
     r_eps = tvm.reduce_axis((0, alpha), 'r_eps')
     r_nu = tvm.reduce_axis((0, alpha), 'r_nu')
-    V = tvm.compute((alpha, alpha, P_round // bnb, C, bnb), lambda eps, nu, b, c, bb:
-                    tvm.sum(input_tile[c][b][r_eps][r_nu][bb] * B[r_eps][eps] * B[r_nu][nu],
+    V = tvm.compute((alpha, alpha, P_round, C), lambda eps, nu, b, c:
+                    tvm.sum(input_tile[c][b][r_eps][r_nu] * B[r_eps][eps] * B[r_nu][nu],
                             axis=[r_eps, r_nu]), name='V')
 
     # batch gemm
     c = tvm.reduce_axis((0, C), name='c')
     M = tvm.compute((alpha, alpha, K, P_round), lambda eps, nu, k, b:
-                    tvm.sum(U[eps][nu][k // bna][c][k % bna] *
-                            V[eps][nu][b // bnb][c][b % bnb], axis=c), name='M')
+                    tvm.sum(U[eps][nu][k][c] *
+                            V[eps][nu][b][c], axis=c), name='M')
 
     # inverse transform
     A = const_array(A_data, 'A')
@@ -165,25 +163,24 @@ def schedule_winograd(s, op):
     s[data_pad].compute_inline()
 
     # pack input tiles
-    c, b, eps, nu, bb = s[d].op.axis
-    s[d].reorder(eps, nu, bb)
+    c, b, eps, nu = s[d].op.axis
+    s[d].reorder(eps, nu)
     aha = s[d].fuse(eps, nu)
-    s[d].unroll(bb)
     tile_and_bind3d(s, d, c, b, aha, 4, 1, 1)
 
     # transform kernel
     s[G].compute_inline()
-    eps, nu, k, c, kk, = s[U].op.axis
+    eps, nu, k, c= s[U].op.axis
     r_kh, r_kw = s[U].op.reduce_axis
-    s[U].reorder(k, c, kk, eps, nu, r_kh, r_kw)
+    s[U].reorder(k, c, eps, nu, r_kh, r_kw)
     _ = [s[U].unroll(x) for x in [eps, nu, r_kh, r_kw]]
     tile_and_bind(s, U, k, c, 1, 256)
 
     # transform image
     s[B].compute_inline()
-    eps, nu, b, c, bb = s[V].op.axis
+    eps, nu, b, c= s[V].op.axis
     r_eps, r_nu = s[V].op.reduce_axis
-    s[V].reorder(b, c, bb, eps, nu, r_nu, r_eps)
+    s[V].reorder(b, c, eps, nu, r_nu, r_eps)
     _ = [s[V].unroll(x) for x in [eps, nu, r_eps, r_nu]]
     tile_and_bind(s, V, b, c, 2, 1)
 
@@ -269,8 +266,9 @@ def test(batch, in_channel, in_size, num_filter, kernel, stride, padding, dilati
                           unroll_explicit=(device != "cuda")):
         func = tvm.build(s, [A, W, B], device)
         func(a, w, b)
-        print(func.imported_modules[0].get_source())
+        #print(func.imported_modules[0].get_source())
         np.testing.assert_allclose(b.asnumpy(), b_np, rtol=1e-5)
+        print(np.mean(np.abs(b.asnumpy() - b_np)))
 
 
 test(1, 128, 122, 128, 3, 1, 1)
