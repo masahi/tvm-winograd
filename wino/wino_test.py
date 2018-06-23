@@ -91,7 +91,6 @@ def decl_winograd(data, U, stride, padding, out_dtype):
     P_round = (P + bnb - 1) // bnb * bnb
     assert K % bna == 0 and P_round % bnb == 0
 
-    print(data_pad.shape)
     # pack input tile
     input_tile = tvm.compute((C, P_round, alpha, alpha),
                              lambda c, b, eps, nu:
@@ -111,26 +110,21 @@ def decl_winograd(data, U, stride, padding, out_dtype):
                     tvm.sum(U[eps][nu][k][c] *
                             V[eps][nu][b][c], axis=c), name='M')
 
-    # inverse transform
+    # inverse transform and unpack
     A = const_array(A_data, 'A')
     r_eps = tvm.reduce_axis((0, alpha), 'r_eps')
     r_nu = tvm.reduce_axis((0, alpha), 'r_nu')
-    Y = tvm.compute((K, P, m, m), lambda k, b, vh, vw:
-                    tvm.sum(M[r_eps][r_nu][k][b] * A[r_eps][vh] * A[r_nu][vw],
-                            axis=[r_eps, r_nu]), name='Y')
-
-    # unpack output
     output = tvm.compute((N, K, H, W), lambda n, k, h, w:
-                         Y[k][n * nH * nW + (h//m) * nW + w//m][h % m][w % m],
-                         name='output', tag='winograd_conv_output')
+                    tvm.sum(M[r_eps][r_nu][k][n * nH * nW + (h//m) * nW + w//m] * A[r_eps][h % m] * A[r_nu][w % m],
+                            axis=[r_eps, r_nu]), name='output')
 
     return output
 
 def schedule_winograd(s, op):
     output = op.output(0)
 
-    Y = op.input_tensors[0]
-    M, A = s[Y].op.input_tensors
+#    Y = op.input_tensors[0]
+    M, A = s[output].op.input_tensors
     U, V = s[M].op.input_tensors
     d, B = s[V].op.input_tensors
     data_pad = s[d].op.input_tensors[0]
@@ -162,19 +156,18 @@ def schedule_winograd(s, op):
     s[M].unroll(yi)
     z = s[M].fuse(eps, nu)
     tile_and_bind3d(s, M, z, yo, xo, 1, 8, 1)
-    #s[M].compute_inline()
 
     # inverse transform
     s[A].compute_inline()
-#    s[Y].compute_inline()
-    k, b, vh, vw = s[Y].op.axis
-    r_eps, r_nu = s[Y].op.reduce_axis
-    _ = [s[Y].unroll(x) for x in [vh, vw, r_eps, r_nu]]
-    tile_and_bind(s, Y, k, b, 4, 1)
+    # k, b, vh, vw = s[Y].op.axis
+    # r_eps, r_nu = s[Y].op.reduce_axis
+    # _ = [s[Y].unroll(x) for x in [vh, vw, r_eps, r_nu]]
+    # tile_and_bind(s, Y, k, b, 4, 1)
 
     # schedule output
     if output.op in s.outputs:  # no bias
         output = output
+        print("no bias")
     else:                       # has bias
         s[output].compute_inline()
         output = s.outputs[0]
@@ -257,5 +250,5 @@ def test(batch, in_channel, in_size, num_filter, kernel, stride, padding, dilati
         print(np.mean(np.abs(b.asnumpy() - b_np)))
 
 
-test(1, 128, 122, 128, 3, 1, 1)
+#test(1, 128, 122, 128, 3, 1, 1)
 test(1, 64, 64, 32, 3, 1, 1)
