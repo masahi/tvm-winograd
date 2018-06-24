@@ -124,9 +124,18 @@ def decl_winograd(data, U, stride, padding, out_dtype):
     A = const_array(A_data, 'A')
     r_eps = tvm.reduce_axis((0, alpha), 'r_eps')
     r_nu = tvm.reduce_axis((0, alpha), 'r_nu')
+    Y = tvm.compute((K, P, m, m), lambda k, b, vh, vw:
+                    tvm.sum(M[r_eps][r_nu][k][b] * A[r_eps][vh] * A[r_nu][vw],
+                            axis=[r_eps, r_nu]), name='Y')
+
+    # unpack output
     output = tvm.compute((N, K, H, W), lambda n, k, h, w:
-                    tvm.sum(M[r_eps][r_nu][k][n * nH * nW + (h//m) * nW + w//m] * A[r_eps][h % m] * A[r_nu][w % m],
-                            axis=[r_eps, r_nu]), name='output')
+                         Y[k][n * nH * nW + (h//m) * nW + w//m][h % m][w % m],
+                         name='output', tag='winograd_conv_output')
+
+    # output = tvm.compute((N, K, H, W), lambda n, k, h, w:
+    #                 tvm.sum(M[r_eps][r_nu][k][n * nH * nW + (h//m) * nW + w//m] * A[r_eps][h % m] * A[r_nu][w % m],
+    #                         axis=[r_eps, r_nu]), name='output')
 
     return output
 
@@ -134,8 +143,9 @@ def schedule_winograd(outs):
     s = tvm.create_schedule([x.op for x in outs])
     op = outs[0].op
     output = op.output(0)
+    Y = op.input_tensors[0]
 
-    M, A = s[output].op.input_tensors
+    M, A = s[Y].op.input_tensors
     U, V = s[M].op.input_tensors
     d, B = s[V].op.input_tensors
     data_pad = s[d].op.input_tensors[0]
@@ -200,6 +210,18 @@ def schedule_winograd(outs):
 
     # inverse transform
     s[A].compute_inline()
+    k, b, vh, vw = s[Y].op.axis
+    MM = s.cache_read(M, "local", [Y])
+    YL = s.cache_write(Y, "local")
+    r_eps, r_nu = s[YL].op.reduce_axis
+    ko, ki = s[Y].split(k, factor=16)
+    bo, bi = s[Y].split(b, factor=16)
+    s[Y].bind(ki, tvm.thread_axis("threadIdx.y"))
+    s[Y].bind(bi, tvm.thread_axis("threadIdx.x"))
+    s[Y].bind(ko, tvm.thread_axis("blockIdx.y"))
+    s[Y].bind(bo, tvm.thread_axis("blockIdx.x"))
+    s[YL].compute_at(s[Y], bi)
+    s[MM].compute_at(s[Y], bi)
 
     # schedule output
     if output.op in s.outputs:  # no bias
@@ -209,7 +231,7 @@ def schedule_winograd(outs):
         output = s.outputs[0]
 
     _, k, h, w = s[output].op.axis
-    output_L = s.cache_write(output, "local")
+
     ho, hi = s[output].split(h, factor=16)
     wo, wi = s[output].split(w, factor=16)
     s[output].reorder(k, ho, wo, hi, wi)
@@ -217,8 +239,7 @@ def schedule_winograd(outs):
     s[output].bind(wi, tvm.thread_axis("threadIdx.x"))
     fused = s[output].fuse(k, ho, wo)
     s[output].bind(fused, tvm.thread_axis("blockIdx.x"))
-    s[output_L].compute_at(s[output], wi)
-
+    #s[YL].compute_at(s[output], wi)
     return s
 
 
@@ -296,6 +317,8 @@ for workload in workloads:
     device = "cuda"
     #device = "rocm"
     t_wino = test_winograd(*workload, device)
+    # print(t_wino)
+    # break
 
     # device += " -libs=cudnn"
     # device += " -libs=miopen"
