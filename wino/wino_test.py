@@ -169,25 +169,42 @@ def schedule_winograd(s, op):
     s[VL].compute_at(s[V], wi)
     s[d].compute_at(s[V], wi)
 
-    # batch gemm
-    bna, bnb = 4, 4
-    if data.dtype == 'float16':
-        bnb *= 2
+    UU = s.cache_read(U, 'shared', [M])
+    VV = s.cache_read(V, "shared", [M])
+    # UL = s.cache_read(UU, "local", [M])
+    # VL = s.cache_read(VV, "local", [M])
+    ML = s.cache_write(M, "local")
 
     eps, nu, k, b = s[M].op.axis
-    c = s[M].op.reduce_axis[0]
-    ML = s.cache_write(M, "local")
-    yo, xo, yi, xi = s[M].tile(k, b, bna, bnb)
+    ko, ki = s[M].split(k, factor=16)
+    bo, bi = s[M].split(b, factor=16)
+
     z = s[M].fuse(eps, nu)
 
-    yoo, yoi = s[M].split(yo, 16)
-    xoo, xoi = s[M].split(xo, 16)
     s[M].bind(z, tvm.thread_axis("blockIdx.z"))
-    s[M].bind(yoo, tvm.thread_axis("blockIdx.y"))
-    s[M].bind(yoi, tvm.thread_axis("threadIdx.y"))
-    s[M].bind(xoo, tvm.thread_axis("blockIdx.x"))
-    s[M].bind(xoi, tvm.thread_axis("threadIdx.x"))
-    s[ML].compute_at(s[M], xoi)
+    s[M].bind(ko, tvm.thread_axis("blockIdx.y"))
+    s[M].bind(ki, tvm.thread_axis("threadIdx.y"))
+    s[M].bind(bo, tvm.thread_axis("blockIdx.x"))
+    s[M].bind(bi, tvm.thread_axis("threadIdx.x"))
+    s[ML].compute_at(s[M], bi)
+
+    k = s[ML].op.reduce_axis[0]
+    ko, ki = s[ML].split(k, factor=16)
+    s[UU].compute_at(s[ML], ko)
+    s[VV].compute_at(s[ML], ko)
+
+    num_thread = 16
+    yi, xi, ci, ni = s[UU].op.axis
+    ty, ci = s[UU].split(ci, nparts=num_thread)
+    tx, ni = s[UU].split(ni, nparts=num_thread)
+    s[UU].bind(ty, tvm.thread_axis("threadIdx.y"))
+    s[UU].bind(tx, tvm.thread_axis("threadIdx.x"))
+
+    yi, xi, ci, ni = s[VV].op.axis
+    ty, ci = s[VV].split(ci, nparts=num_thread)
+    tx, ni = s[VV].split(ni, nparts=num_thread)
+    s[VV].bind(ty, tvm.thread_axis("threadIdx.y"))
+    s[VV].bind(tx, tvm.thread_axis("threadIdx.x"))
 
     # inverse transform
     s[A].compute_inline()
@@ -277,7 +294,7 @@ def test(batch, in_channel, in_size, num_filter, kernel, stride, padding, dilati
     with tvm.build_config(auto_unroll_max_step=1400,
                           unroll_explicit=(device != "cuda")):
         func = tvm.build(s, [A, U, B], device)
-        #print(tvm.lower(s, [A, U, B], simple_mode=True))
+        print(tvm.lower(s, [A, U, B], simple_mode=True))
         func(a, u, b)
         num_runs = 10
         timer = func.time_evaluator(func.entry_name, ctx, number=num_runs)
