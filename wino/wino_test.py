@@ -10,7 +10,7 @@ from topi import util
 from topi.nn import pad
 from topi import tag
 
-def verify_conv2d_nchw(batch, in_channel, in_size, num_filter, kernel, stride, padding, dilation=1):
+def verify_conv2d_nchw(batch, in_channel, in_size, num_filter, kernel, stride, padding, dilation, device):
     in_height = in_width = in_size
 
     A = tvm.placeholder((batch, in_channel, in_height, in_width), name='A')
@@ -31,31 +31,28 @@ def verify_conv2d_nchw(batch, in_channel, in_size, num_filter, kernel, stride, p
 
     a_np, w_np, b_np, c_np = get_ref_data()
 
-    def check_device(device):
-        ctx = tvm.context(device, 0)
-        if not ctx.exist:
-            print("Skip because %s is not enabled" % device)
-            return
-        print("Running on target: %s" % device)
-        with tvm.target.create(device):
-            dW = topi.nn.dilate(W, (1, 1, dilation, dilation))
-            B = topi.nn.conv2d(A, dW, stride, padding, layout='NCHW')
-            s1 = topi.generic.schedule_conv2d_nchw([B])
-        a = tvm.nd.array(a_np, ctx)
-        w = tvm.nd.array(w_np, ctx)
-        b = tvm.nd.array(np.zeros(get_const_tuple(B.shape), dtype=B.dtype), ctx)
-        with tvm.build_config(auto_unroll_max_step=1400,
-                              unroll_explicit=(device != "cuda")):
-            func = tvm.build(s1, [A, W, B], device, name="conv2d_%d_%d_%d_%d_%d_%d_%d_%d" % (batch, in_channel, in_size, num_filter, kernel, stride, padding, dilation))
-            print(tvm.lower(s1, [A, W, B], simple_mode=True))
-            func(a, w, b)
-            np.testing.assert_allclose(b.asnumpy(), b_np, rtol=1e-5)
-            num_runs = 100
-            timer = func.time_evaluator(func.entry_name, ctx, number=num_runs)
-            t = timer(a, w, b).mean
-            print("elapsed %f" % t)
-
-    check_device("cuda")
+    ctx = tvm.context(device, 0)
+    if not ctx.exist:
+        print("Skip because %s is not enabled" % device)
+        return
+    print("Running on target: %s" % device)
+    with tvm.target.create(device):
+        dW = topi.nn.dilate(W, (1, 1, dilation, dilation))
+        B = topi.nn.conv2d(A, dW, stride, padding, layout='NCHW')
+        s1 = topi.generic.schedule_conv2d_nchw([B])
+    a = tvm.nd.array(a_np, ctx)
+    w = tvm.nd.array(w_np, ctx)
+    b = tvm.nd.array(np.zeros(get_const_tuple(B.shape), dtype=B.dtype), ctx)
+    with tvm.build_config(auto_unroll_max_step=1400,
+                          unroll_explicit=(device != "cuda")):
+        func = tvm.build(s1, [A, W, B], device, name="conv2d_%d_%d_%d_%d_%d_%d_%d_%d" % (batch, in_channel, in_size, num_filter, kernel, stride, padding, dilation))
+        #print(tvm.lower(s1, [A, W, B], simple_mode=True))
+        func(a, w, b)
+        np.testing.assert_allclose(b.asnumpy(), b_np, rtol=1e-5)
+        num_runs = 100
+        timer = func.time_evaluator(func.entry_name, ctx, number=num_runs)
+        t = timer(a, w, b).mean
+        print("elapsed %f" % t)
 
 def const_array(data, name):
     """ convert an const array to tvm tensor"""
@@ -153,7 +150,6 @@ def schedule_winograd(s, op):
     data = s[data_pad].op.input_tensors[0]
 
     s[data_pad].compute_inline()
-    s[d].compute_inline()
 
     # transform image
     s[B].compute_inline()
@@ -162,7 +158,6 @@ def schedule_winograd(s, op):
     eps, nu, P, C = s[V].op.axis
     r_eps, r_nu = s[VL].op.reduce_axis
     s[V].reorder(P, C, eps, nu)
-    #s[d].compute_at(s[V], nu)
 
     ho, hi = s[V].split(P, factor=16)
     wo, wi = s[V].split(C, factor=16)
@@ -172,6 +167,7 @@ def schedule_winograd(s, op):
     s[V].bind(wo, tvm.thread_axis("blockIdx.x"))
 
     s[VL].compute_at(s[V], wi)
+    s[d].compute_at(s[V], wi)
 
     # batch gemm
     bna, bnb = 4, 4
@@ -212,7 +208,6 @@ def schedule_winograd(s, op):
     s[output].bind(wi, tvm.thread_axis("threadIdx.x"))
     fused = s[output].fuse(k, ho, wo)
     s[output].bind(fused, tvm.thread_axis("blockIdx.x"))
-
     s[output_L].compute_at(s[output], wi)
 
 def schedule_conv2d_nchw(outs):
@@ -247,7 +242,7 @@ def transform_filter(w_np):
     return out
 
 
-def test(batch, in_channel, in_size, num_filter, kernel, stride, padding, dilation=1):
+def test(batch, in_channel, in_size, num_filter, kernel, stride, padding, dilation, device):
     in_height = in_width = in_size
 
     A = tvm.placeholder((batch, in_channel, in_height, in_width), name='A')
@@ -269,7 +264,6 @@ def test(batch, in_channel, in_size, num_filter, kernel, stride, padding, dilati
 
     a_np, w_np, b_np, c_np = get_ref_data()
 
-    device = "cuda"
     with tvm.target.create(device):
         B = decl_winograd(A, U, stride, padding, dtype)
         s = schedule_conv2d_nchw([B])
@@ -283,17 +277,18 @@ def test(batch, in_channel, in_size, num_filter, kernel, stride, padding, dilati
     with tvm.build_config(auto_unroll_max_step=1400,
                           unroll_explicit=(device != "cuda")):
         func = tvm.build(s, [A, U, B], device)
-        print(tvm.lower(s, [A, U, B], simple_mode=True))
+        #print(tvm.lower(s, [A, U, B], simple_mode=True))
         func(a, u, b)
         num_runs = 10
         timer = func.time_evaluator(func.entry_name, ctx, number=num_runs)
         t = timer(a, u, b).mean
         print("elapsed %f" % t)
         np.testing.assert_allclose(b.asnumpy(), b_np, rtol=1e-5)
-        print(func.imported_modules[0].get_source())
+        #print(func.imported_modules[0].get_source())
 
+device = "cuda"
 
-test(1, 128, 122, 128, 3, 1, 1)
-#test(1, 64, 64, 32, 3, 1, 1)
-#verify_conv2d_nchw(1, 128, 122, 128, 3, 1, 1)
-#verify_conv2d_nchw(1, 64, 64, 32, 3, 1, 1)
+test(1, 128, 122, 128, 3, 1, 1, 1, device)
+# test(1, 64, 64, 32, 3, 1, 1, 1, device)
+# verify_conv2d_nchw(1, 128, 122, 128, 3, 1, 1, 1, device)
+# verify_conv2d_nchw(1, 64, 64, 32, 3, 1, 1, 1, device)
