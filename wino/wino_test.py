@@ -157,11 +157,12 @@ def schedule_winograd(s, op):
 
     # transform image
     s[B].compute_inline()
-    eps, nu, P, C = s[V].op.axis
-    r_eps, r_nu = s[V].op.reduce_axis
-    s[V].reorder(P, C, eps, nu, r_nu, r_eps)
-
     VL = s.cache_write(V, "local")
+
+    eps, nu, P, C = s[V].op.axis
+    r_eps, r_nu = s[VL].op.reduce_axis
+    s[V].reorder(P, C, eps, nu)
+    #s[d].compute_at(s[V], nu)
 
     ho, hi = s[V].split(P, factor=16)
     wo, wi = s[V].split(C, factor=16)
@@ -289,7 +290,7 @@ def test(batch, in_channel, in_size, num_filter, kernel, stride, padding, dilati
         t = timer(a, u, b).mean
         print("elapsed %f" % t)
         np.testing.assert_allclose(b.asnumpy(), b_np, rtol=1e-5)
-        #print(func.imported_modules[0].get_source())
+        print(func.imported_modules[0].get_source())
 
 
 test(1, 128, 122, 128, 3, 1, 1)
