@@ -4,23 +4,21 @@ import tvm
 import topi
 import topi.testing
 from tvm.contrib.pickle_memoize import memoize
-from topi.nn.util import *
-from topi.util import *
 from topi import util
 from topi.nn import pad
-from topi import tag
 
-def verify_conv2d_nchw(batch, in_channel, in_size, num_filter, kernel, stride, padding, dilation, device, use_cudnn=False):
+def reference_direct(batch, in_channel, in_size, num_filter, kernel, stride, padding, device):
     in_height = in_width = in_size
 
     A = tvm.placeholder((batch, in_channel, in_height, in_width), name='A')
     W = tvm.placeholder((num_filter, in_channel, kernel, kernel), name='W')
 
-    a_shape = get_const_tuple(A.shape)
-    w_shape = get_const_tuple(W.shape)
+    a_shape = util.get_const_tuple(A.shape)
+    w_shape = util.get_const_tuple(W.shape)
     dtype = A.dtype
+    dilation = 1
 
-    @memoize("topi.tests.test_topi_conv2d_nchw.verify_conv2d_nchw")
+    @memoize("topi.tests.test_topi_conv2d_nchw.reference_direct")
     def get_ref_data():
         a_np = np.random.uniform(size=a_shape).astype(dtype)
         w_np = np.random.uniform(size=w_shape).astype(dtype)
@@ -35,16 +33,13 @@ def verify_conv2d_nchw(batch, in_channel, in_size, num_filter, kernel, stride, p
     if not ctx.exist:
         print("Skip because %s is not enabled" % device)
         return
-    print("Running on target: %s" % device)
-    if use_cudnn:
-        device += " -libs=cudnn"
     with tvm.target.create(device):
         dW = topi.nn.dilate(W, (1, 1, dilation, dilation))
         B = topi.nn.conv2d(A, dW, stride, padding, layout='NCHW')
         s1 = topi.generic.schedule_conv2d_nchw([B])
     a = tvm.nd.array(a_np, ctx)
     w = tvm.nd.array(w_np, ctx)
-    b = tvm.nd.array(np.zeros(get_const_tuple(B.shape), dtype=B.dtype), ctx)
+    b = tvm.nd.array(np.zeros(util.get_const_tuple(B.shape), dtype=B.dtype), ctx)
     with tvm.build_config(auto_unroll_max_step=1400,
                           unroll_explicit=(device != "cuda")):
         func = tvm.build(s1, [A, W, B], device, name="conv2d_%d_%d_%d_%d_%d_%d_%d_%d" % (batch, in_channel, in_size, num_filter, kernel, stride, padding, dilation))
@@ -53,8 +48,7 @@ def verify_conv2d_nchw(batch, in_channel, in_size, num_filter, kernel, stride, p
         np.testing.assert_allclose(b.asnumpy(), b_np, rtol=1e-5)
         num_runs = 100
         timer = func.time_evaluator(func.entry_name, ctx, number=num_runs)
-        t = timer(a, w, b).mean
-        print("elapsed %f" % t)
+        return timer(a, w, b).mean
 
 def const_array(data, name):
     """ convert an const array to tvm tensor"""
@@ -107,14 +101,8 @@ def decl_winograd(data, U, stride, padding, out_dtype):
     nH, nW = (H + m-1) // m, (W + m-1) // m
     P = N * nH * nW
 
-    bna, bnb = 4, 4
-    if data.dtype == 'float16':
-        bnb *= 2
-    P_round = (P + bnb - 1) // bnb * bnb
-    assert K % bna == 0 and P_round % bnb == 0
-
     # pack input tile
-    input_tile = tvm.compute((C, P_round, alpha, alpha),
+    input_tile = tvm.compute((C, P, alpha, alpha),
                              lambda c, b, eps, nu:
                              tvm.select(b < P, data_pad[b // (nH*nW)][c][b// nW % nH * m + eps][b % nW * m + nu], tvm.const(0, data_pad.dtype)), name='d')
 
@@ -122,13 +110,13 @@ def decl_winograd(data, U, stride, padding, out_dtype):
     B = const_array(B_data, 'B')
     r_eps = tvm.reduce_axis((0, alpha), 'r_eps')
     r_nu = tvm.reduce_axis((0, alpha), 'r_nu')
-    V = tvm.compute((alpha, alpha, C, P_round), lambda eps, nu, c, b:
+    V = tvm.compute((alpha, alpha, C, P), lambda eps, nu, c, b:
                     tvm.sum(input_tile[c][b][r_eps][r_nu] * B[r_eps][eps] * B[r_nu][nu],
                             axis=[r_eps, r_nu]), name='V')
 
     # batch gemm
     c = tvm.reduce_axis((0, C), name='c')
-    M = tvm.compute((alpha, alpha, K, P_round), lambda eps, nu, k, b:
+    M = tvm.compute((alpha, alpha, K, P), lambda eps, nu, k, b:
                     tvm.sum(U[eps][nu][k][c] *
                             V[eps][nu][c][b], axis=c), name='M')
 
@@ -142,7 +130,9 @@ def decl_winograd(data, U, stride, padding, out_dtype):
 
     return output
 
-def schedule_winograd(s, op):
+def schedule_winograd(outs):
+    s = tvm.create_schedule([x.op for x in outs])
+    op = outs[0].op
     output = op.output(0)
 
     M, A = s[output].op.input_tensors
@@ -229,21 +219,8 @@ def schedule_winograd(s, op):
     s[output].bind(fused, tvm.thread_axis("blockIdx.x"))
     s[output_L].compute_at(s[output], wi)
 
-def schedule_conv2d_nchw(outs):
-    outs = [outs] if isinstance(outs, tvm.tensor.Tensor) else outs
-    s = tvm.create_schedule([x.op for x in outs])
-
-    def traverse(op):
-        # if tag.is_broadcast(op.tag):
-        #     if op not in s.outputs:
-        #         s[op].compute_inline()
-        #     for tensor in op.input_tensors:
-        #         if tensor.op.input_tensors:
-        #             traverse(tensor.op)
-        schedule_winograd(s, op)
-
-    traverse(outs[0].op)
     return s
+
 
 def transform_filter(w_np):
     num_filter, in_channel, kernel, kernel = w_np.shape
@@ -261,18 +238,19 @@ def transform_filter(w_np):
     return out
 
 
-def test(batch, in_channel, in_size, num_filter, kernel, stride, padding, dilation, device):
+def test_winograd(batch, in_channel, in_size, num_filter, kernel, stride, padding, device):
     in_height = in_width = in_size
 
     A = tvm.placeholder((batch, in_channel, in_height, in_width), name='A')
     W = tvm.placeholder((num_filter, in_channel, kernel, kernel), name='W')
     U = tvm.placeholder((4, 4, num_filter, in_channel), name='W')
 
-    a_shape = get_const_tuple(A.shape)
-    w_shape = get_const_tuple(W.shape)
+    a_shape = util.get_const_tuple(A.shape)
+    w_shape = util.get_const_tuple(W.shape)
     dtype = A.dtype
+    dilation = 1
 
-    @memoize("topi.tests.test_topi_conv2d_nchw.verify_conv2d_nchw")
+    @memoize("topi.tests.test_topi_conv2d_nchw.wino")
     def get_ref_data():
         a_np = np.random.uniform(size=a_shape).astype(dtype)
         w_np = np.random.uniform(size=w_shape).astype(dtype)
@@ -285,29 +263,45 @@ def test(batch, in_channel, in_size, num_filter, kernel, stride, padding, dilati
 
     with tvm.target.create(device):
         B = decl_winograd(A, U, stride, padding, dtype)
-        s = schedule_conv2d_nchw([B])
+        s = schedule_winograd([B])
 
     u_np = transform_filter(w_np)
 
     ctx = tvm.context(device, 0)
     a = tvm.nd.array(a_np, ctx)
     u = tvm.nd.array(u_np, ctx)
-    b = tvm.nd.array(np.zeros(get_const_tuple(B.shape), dtype=B.dtype), ctx)
+    b = tvm.nd.array(np.zeros(util.get_const_tuple(B.shape), dtype=B.dtype), ctx)
     with tvm.build_config(auto_unroll_max_step=1400,
                           unroll_explicit=(device != "cuda")):
         func = tvm.build(s, [A, U, B], device)
-        print(tvm.lower(s, [A, U, B], simple_mode=True))
+        #print(tvm.lower(s, [A, U, B], simple_mode=True))
         func(a, u, b)
         num_runs = 10
         timer = func.time_evaluator(func.entry_name, ctx, number=num_runs)
-        t = timer(a, u, b).mean
-        print("elapsed %f" % t)
+
         np.testing.assert_allclose(b.asnumpy(), b_np, rtol=1e-5)
         #print(func.imported_modules[0].get_source())
+        return timer(a, u, b).mean
 
-device = "cuda"
 
-test(1, 128, 122, 128, 3, 1, 1, 1, device)
-# test(1, 64, 64, 32, 3, 1, 1, 1, device)
-# verify_conv2d_nchw(1, 128, 122, 128, 3, 1, 1, 1, device)
-# verify_conv2d_nchw(1, 64, 64, 32, 3, 1, 1, 1, device)
+workloads = [(1, 128, 122, 128, 3, 1, 1),
+             (1, 64, 56, 64, 3, 1, 1),
+             (1, 64, 64, 32, 3, 1, 1),
+             (1, 64, 224, 64, 3, 1, 1),
+             (1, 64, 112, 128, 3, 1, 1),
+             (1, 512, 28, 512, 3, 1, 1)
+            ]
+
+for workload in workloads:
+    device = "cuda"
+    #device = "rocm"
+    t_wino = test_winograd(*workload, device)
+
+    # device += " -libs=cudnn"
+    # device += " -libs=miopen"
+    if workload[1] == 512:
+        t_direct = None # tvm cuda conv2d cannot handle this workload
+    else:
+        t_direct = reference_direct(*workload, device)
+
+    print(t_wino, t_direct)
