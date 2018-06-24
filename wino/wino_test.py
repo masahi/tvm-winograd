@@ -10,7 +10,7 @@ from topi import util
 from topi.nn import pad
 from topi import tag
 
-def verify_conv2d_nchw(batch, in_channel, in_size, num_filter, kernel, stride, padding, dilation, device):
+def verify_conv2d_nchw(batch, in_channel, in_size, num_filter, kernel, stride, padding, dilation, device, use_cudnn=False):
     in_height = in_width = in_size
 
     A = tvm.placeholder((batch, in_channel, in_height, in_width), name='A')
@@ -36,6 +36,8 @@ def verify_conv2d_nchw(batch, in_channel, in_size, num_filter, kernel, stride, p
         print("Skip because %s is not enabled" % device)
         return
     print("Running on target: %s" % device)
+    if use_cudnn:
+        device += " -libs=cudnn"
     with tvm.target.create(device):
         dW = topi.nn.dilate(W, (1, 1, dilation, dilation))
         B = topi.nn.conv2d(A, dW, stride, padding, layout='NCHW')
@@ -120,7 +122,7 @@ def decl_winograd(data, U, stride, padding, out_dtype):
     B = const_array(B_data, 'B')
     r_eps = tvm.reduce_axis((0, alpha), 'r_eps')
     r_nu = tvm.reduce_axis((0, alpha), 'r_nu')
-    V = tvm.compute((alpha, alpha, P_round, C), lambda eps, nu, b, c:
+    V = tvm.compute((alpha, alpha, C, P_round), lambda eps, nu, c, b:
                     tvm.sum(input_tile[c][b][r_eps][r_nu] * B[r_eps][eps] * B[r_nu][nu],
                             axis=[r_eps, r_nu]), name='V')
 
@@ -128,7 +130,7 @@ def decl_winograd(data, U, stride, padding, out_dtype):
     c = tvm.reduce_axis((0, C), name='c')
     M = tvm.compute((alpha, alpha, K, P_round), lambda eps, nu, k, b:
                     tvm.sum(U[eps][nu][k][c] *
-                            V[eps][nu][b][c], axis=c), name='M')
+                            V[eps][nu][c][b], axis=c), name='M')
 
     # inverse transform and unpack
     A = const_array(A_data, 'A')
@@ -155,12 +157,12 @@ def schedule_winograd(s, op):
     s[B].compute_inline()
     VL = s.cache_write(V, "local")
 
-    eps, nu, P, C = s[V].op.axis
+    eps, nu, C, P = s[V].op.axis
     r_eps, r_nu = s[VL].op.reduce_axis
-    s[V].reorder(P, C, eps, nu)
+    s[V].reorder(C, P, eps, nu)
 
-    ho, hi = s[V].split(P, factor=16)
-    wo, wi = s[V].split(C, factor=16)
+    ho, hi = s[V].split(C, factor=16)
+    wo, wi = s[V].split(P, factor=16)
     s[V].bind(hi, tvm.thread_axis("threadIdx.y"))
     s[V].bind(wi, tvm.thread_axis("threadIdx.x"))
     s[V].bind(ho, tvm.thread_axis("blockIdx.y"))
