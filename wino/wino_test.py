@@ -10,29 +10,52 @@ from topi import util
 from topi.nn import pad
 from topi import tag
 
-def tile_and_bind(s, tensor, y, x, y_factor, x_factor=None):
-    """ tile and bind to GPU threads """
-    x_factor = x_factor or y_factor
-    yo, xo, yi, xi = s[tensor].tile(y, x, y_factor, x_factor)
-    s[tensor].bind(xo, tvm.thread_axis("blockIdx.x"))
-    s[tensor].bind(xi, tvm.thread_axis("threadIdx.x"))
-    s[tensor].bind(yo, tvm.thread_axis("blockIdx.y"))
-    s[tensor].bind(yi, tvm.thread_axis("threadIdx.y"))
-    return yo, xo, yi, xi
+def verify_conv2d_nchw(batch, in_channel, in_size, num_filter, kernel, stride, padding, dilation=1):
+    in_height = in_width = in_size
 
-def tile_and_bind3d(s, tensor, z, y, x, z_factor=2, y_factor=None, x_factor=None):
-    """ tile and bind 3d """
-    y_factor = y_factor or z_factor
-    x_factor = x_factor or y_factor
-    zo, zi = s[tensor].split(z, z_factor)
-    yo, yi = s[tensor].split(y, y_factor)
-    xo, xi = s[tensor].split(x, x_factor)
-    s[tensor].bind(zo, tvm.thread_axis("blockIdx.z"))
-    s[tensor].bind(zi, tvm.thread_axis("threadIdx.z"))
-    s[tensor].bind(yo, tvm.thread_axis("blockIdx.y"))
-    s[tensor].bind(yi, tvm.thread_axis("threadIdx.y"))
-    s[tensor].bind(xo, tvm.thread_axis("blockIdx.x"))
-    s[tensor].bind(xi, tvm.thread_axis("threadIdx.x"))
+    A = tvm.placeholder((batch, in_channel, in_height, in_width), name='A')
+    W = tvm.placeholder((num_filter, in_channel, kernel, kernel), name='W')
+
+    a_shape = get_const_tuple(A.shape)
+    w_shape = get_const_tuple(W.shape)
+    dtype = A.dtype
+
+    @memoize("topi.tests.test_topi_conv2d_nchw.verify_conv2d_nchw")
+    def get_ref_data():
+        a_np = np.random.uniform(size=a_shape).astype(dtype)
+        w_np = np.random.uniform(size=w_shape).astype(dtype)
+        dw_np = topi.testing.dilate_python(w_np, (1, 1, dilation, dilation))
+        b_np = topi.testing.conv2d_nchw_python(a_np, dw_np, stride, padding)
+        c_np = np.maximum(b_np, 0)
+        return a_np, w_np, b_np, c_np
+
+    a_np, w_np, b_np, c_np = get_ref_data()
+
+    def check_device(device):
+        ctx = tvm.context(device, 0)
+        if not ctx.exist:
+            print("Skip because %s is not enabled" % device)
+            return
+        print("Running on target: %s" % device)
+        with tvm.target.create(device):
+            dW = topi.nn.dilate(W, (1, 1, dilation, dilation))
+            B = topi.nn.conv2d(A, dW, stride, padding, layout='NCHW')
+            s1 = topi.generic.schedule_conv2d_nchw([B])
+        a = tvm.nd.array(a_np, ctx)
+        w = tvm.nd.array(w_np, ctx)
+        b = tvm.nd.array(np.zeros(get_const_tuple(B.shape), dtype=B.dtype), ctx)
+        with tvm.build_config(auto_unroll_max_step=1400,
+                              unroll_explicit=(device != "cuda")):
+            func = tvm.build(s1, [A, W, B], device, name="conv2d_%d_%d_%d_%d_%d_%d_%d_%d" % (batch, in_channel, in_size, num_filter, kernel, stride, padding, dilation))
+            print(tvm.lower(s1, [A, W, B], simple_mode=True))
+            func(a, w, b)
+            np.testing.assert_allclose(b.asnumpy(), b_np, rtol=1e-5)
+            num_runs = 100
+            timer = func.time_evaluator(func.entry_name, ctx, number=num_runs)
+            t = timer(a, w, b).mean
+            print("elapsed %f" % t)
+
+    check_device("cuda")
 
 def const_array(data, name):
     """ convert an const array to tvm tensor"""
@@ -134,11 +157,20 @@ def schedule_winograd(s, op):
 
     # transform image
     s[B].compute_inline()
-    eps, nu, b, c= s[V].op.axis
+    eps, nu, P, C = s[V].op.axis
     r_eps, r_nu = s[V].op.reduce_axis
-    s[V].reorder(b, c, eps, nu, r_nu, r_eps)
-    _ = [s[V].unroll(x) for x in [eps, nu, r_eps, r_nu]]
-    tile_and_bind(s, V, b, c, 16, 16)
+    s[V].reorder(P, C, eps, nu, r_nu, r_eps)
+
+    VL = s.cache_write(V, "local")
+
+    ho, hi = s[V].split(P, factor=16)
+    wo, wi = s[V].split(C, factor=16)
+    s[V].bind(hi, tvm.thread_axis("threadIdx.y"))
+    s[V].bind(wi, tvm.thread_axis("threadIdx.x"))
+    s[V].bind(ho, tvm.thread_axis("blockIdx.y"))
+    s[V].bind(wo, tvm.thread_axis("blockIdx.x"))
+
+    s[VL].compute_at(s[V], wi)
 
     # batch gemm
     bna, bnb = 4, 4
@@ -147,13 +179,18 @@ def schedule_winograd(s, op):
 
     eps, nu, k, b = s[M].op.axis
     c = s[M].op.reduce_axis[0]
+    ML = s.cache_write(M, "local")
     yo, xo, yi, xi = s[M].tile(k, b, bna, bnb)
-    s[M].reorder(c, yi, xi)
-    c, c_unroll = s[M].split(c, 2)
-    s[M].unroll(c_unroll)
-    s[M].unroll(yi)
     z = s[M].fuse(eps, nu)
-    tile_and_bind3d(s, M, z, yo, xo, 1, 16, 16)
+
+    yoo, yoi = s[M].split(yo, 16)
+    xoo, xoi = s[M].split(xo, 16)
+    s[M].bind(z, tvm.thread_axis("blockIdx.z"))
+    s[M].bind(yoo, tvm.thread_axis("blockIdx.y"))
+    s[M].bind(yoi, tvm.thread_axis("threadIdx.y"))
+    s[M].bind(xoo, tvm.thread_axis("blockIdx.x"))
+    s[M].bind(xoi, tvm.thread_axis("threadIdx.x"))
+    s[ML].compute_at(s[M], xoi)
 
     # inverse transform
     s[A].compute_inline()
@@ -166,13 +203,16 @@ def schedule_winograd(s, op):
         output = s.outputs[0]
 
     _, k, h, w = s[output].op.axis
+    output_L = s.cache_write(output, "local")
     ho, hi = s[output].split(h, factor=16)
     wo, wi = s[output].split(w, factor=16)
     s[output].reorder(k, ho, wo, hi, wi)
-    fused = s[output].fuse(k, ho, wo)
     s[output].bind(hi, tvm.thread_axis("threadIdx.y"))
     s[output].bind(wi, tvm.thread_axis("threadIdx.x"))
+    fused = s[output].fuse(k, ho, wo)
     s[output].bind(fused, tvm.thread_axis("blockIdx.x"))
+
+    s[output_L].compute_at(s[output], wi)
 
 def schedule_conv2d_nchw(outs):
     outs = [outs] if isinstance(outs, tvm.tensor.Tensor) else outs
@@ -244,61 +284,15 @@ def test(batch, in_channel, in_size, num_filter, kernel, stride, padding, dilati
         func = tvm.build(s, [A, U, B], device)
         print(tvm.lower(s, [A, U, B], simple_mode=True))
         func(a, u, b)
-        num_runs = 100
+        num_runs = 10
         timer = func.time_evaluator(func.entry_name, ctx, number=num_runs)
         t = timer(a, u, b).mean
         print("elapsed %f" % t)
         np.testing.assert_allclose(b.asnumpy(), b_np, rtol=1e-5)
+        #print(func.imported_modules[0].get_source())
 
-def verify_conv2d_nchw(batch, in_channel, in_size, num_filter, kernel, stride, padding, dilation=1):
-    in_height = in_width = in_size
-
-    A = tvm.placeholder((batch, in_channel, in_height, in_width), name='A')
-    W = tvm.placeholder((num_filter, in_channel, kernel, kernel), name='W')
-
-    a_shape = get_const_tuple(A.shape)
-    w_shape = get_const_tuple(W.shape)
-    dtype = A.dtype
-
-    @memoize("topi.tests.test_topi_conv2d_nchw.verify_conv2d_nchw")
-    def get_ref_data():
-        a_np = np.random.uniform(size=a_shape).astype(dtype)
-        w_np = np.random.uniform(size=w_shape).astype(dtype)
-        dw_np = topi.testing.dilate_python(w_np, (1, 1, dilation, dilation))
-        b_np = topi.testing.conv2d_nchw_python(a_np, dw_np, stride, padding)
-        c_np = np.maximum(b_np, 0)
-        return a_np, w_np, b_np, c_np
-
-    a_np, w_np, b_np, c_np = get_ref_data()
-
-    def check_device(device):
-        ctx = tvm.context(device, 0)
-        if not ctx.exist:
-            print("Skip because %s is not enabled" % device)
-            return
-        print("Running on target: %s" % device)
-        with tvm.target.create(device):
-            dW = topi.nn.dilate(W, (1, 1, dilation, dilation))
-            B = topi.nn.conv2d(A, dW, stride, padding, layout='NCHW')
-            s1 = topi.generic.schedule_conv2d_nchw([B])
-        a = tvm.nd.array(a_np, ctx)
-        w = tvm.nd.array(w_np, ctx)
-        b = tvm.nd.array(np.zeros(get_const_tuple(B.shape), dtype=B.dtype), ctx)
-        with tvm.build_config(auto_unroll_max_step=1400,
-                              unroll_explicit=(device != "cuda")):
-            func = tvm.build(s1, [A, W, B], device, name="conv2d_%d_%d_%d_%d_%d_%d_%d_%d" % (batch, in_channel, in_size, num_filter, kernel, stride, padding, dilation))
-            print(tvm.lower(s1, [A, W, B], simple_mode=True))
-            func(a, w, b)
-            np.testing.assert_allclose(b.asnumpy(), b_np, rtol=1e-5)
-            num_runs = 100
-            timer = func.time_evaluator(func.entry_name, ctx, number=num_runs)
-            t = timer(a, w, b).mean
-            print("elapsed %f" % t)
-
-    check_device("cuda")
 
 test(1, 128, 122, 128, 3, 1, 1)
 #test(1, 64, 64, 32, 3, 1, 1)
-
-verify_conv2d_nchw(1, 128, 122, 128, 3, 1, 1)
+#verify_conv2d_nchw(1, 128, 122, 128, 3, 1, 1)
 #verify_conv2d_nchw(1, 64, 64, 32, 3, 1, 1)
