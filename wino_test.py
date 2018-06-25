@@ -298,41 +298,64 @@ def test_winograd(batch, in_channel, in_size, num_filter, kernel, stride, paddin
     with tvm.build_config(auto_unroll_max_step=1400,
                           unroll_explicit=(device != "cuda")):
         func = tvm.build(s, [A, U, B], device)
-        print(tvm.lower(s, [A, U, B], simple_mode=True))
+        #print(tvm.lower(s, [A, U, B], simple_mode=True))
         func(a, u, b)
-        num_runs = 10
+        num_runs = 100
         timer = func.time_evaluator(func.entry_name, ctx, number=num_runs)
 
         np.testing.assert_allclose(b.asnumpy(), b_np, rtol=1e-5)
-        #print(func.imported_modules[0].get_source())
+        #print(func.imported_modules[0].get_source("asm"))
+        #print(func.get_source("llvm"))
         return timer(a, u, b).mean
 
 
-workloads = [(1, 128, 122, 128, 3, 1, 1),
-             # (1, 64, 56, 64, 3, 1, 1),
-             # (1, 64, 64, 32, 3, 1, 1),
-             # (1, 64, 224, 64, 3, 1, 1),
-             # (1, 64, 112, 128, 3, 1, 1),
-             # (1, 512, 28, 512, 3, 1, 1),
-             # (8, 128, 122, 128, 3, 1, 1),
-             # (16, 64, 56, 64, 3, 1, 1),
-             # (32, 64, 64, 32, 3, 1, 1),
-             # (64, 64, 224, 64, 3, 1, 1),
-             # (128, 64, 112, 128, 3, 1, 1),
+# for copy paste as markdown
+def generate_table(workloads, wino_times, direct_times, lib_times, lib_name):
+    print("| (batch,CI,size,CO) | TVM Winograd | TVM Direct | %s |" % lib_name)
+    print("|------------- |:-------------:|:-------------:|:-------------:|")
+    for (workload, t_wino, t_direct, t_lib) in zip(workloads, wino_times, direct_times, lib_times):
+        if t_direct:
+            print("|", workload, "| %.3f | %.3f | %.3f" % (t_wino,  t_direct, t_lib))
+        else:
+            print("|", workload, "| %.3f | N/A | %.3f" % (t_wino, t_lib))
+
+
+workloads = [(1, 128, 122, 128),
+             (1, 64, 56, 64),
+             (1, 64, 64, 32),
+             (1, 64, 224, 64),
+             (1, 64, 112, 128),
+             (1, 512, 28, 512),
+             (8, 128, 122, 128),
+             (16, 64, 56, 64),
+             (32, 64, 64, 32),
+             (64, 128, 32, 128)
             ]
 
+wino_times = []
+direct_times = []
+lib_times = []
+
 for workload in workloads:
-    device = "cuda"
-    #device = "rocm"
-    t_wino = test_winograd(*workload, device)
-    print(t_wino)
-    break
+    #device = "cuda"
+    device = "rocm"
+    t_wino = test_winograd(*workload, 3, 1, 1, device)
+
+    if workload[1] == 512 or workload[0] > 1 or (workload[1] == 128 and device == "rocm"):
+        t_direct = None # tvm direct conv2d cannot handle this workload
+    else:
+        t_direct = reference_direct(*workload, 3, 1, 1, device)
 
     # device += " -libs=cudnn"
-    # device += " -libs=miopen"
-    if workload[1] == 512:
-        t_direct = None # tvm cuda conv2d cannot handle this workload
-    else:
-        t_direct = reference_direct(*workload, device)
+    device += " -libs=miopen"
+    t_lib = reference_direct(*workload, 3, 1, 1, device)
 
     print(t_wino, t_direct)
+
+    wino_times.append(t_wino * 1000)
+    lib_times.append(t_lib * 1000)
+    if t_direct:
+        t_direct *= 1000
+    direct_times.append(t_direct)
+
+generate_table(workloads, wino_times, direct_times, lib_times, "MIOpen Winograd")
