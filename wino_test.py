@@ -68,7 +68,7 @@ def const_array(data, name):
 def decl_winograd(data, U, stride, padding, out_dtype):
     """declare winograd fast convolution F(2x2, 3x3) for conv2d"""
     N, C, H, W = [util.get_const_int(x) for x in data.shape]
-    _, _, K, C = [util.get_const_int(x) for x in U.shape]
+    _, _, C, K = [util.get_const_int(x) for x in U.shape]
     HPAD, WPAD = 1,1
     if isinstance(stride, (tuple, list)):
         HSTR, WSTR = stride
@@ -116,7 +116,7 @@ def decl_winograd(data, U, stride, padding, out_dtype):
     # batch gemm
     c = tvm.reduce_axis((0, C), name='c')
     M = tvm.compute((alpha, alpha, K, P), lambda eps, nu, k, b:
-                    tvm.sum(U[eps][nu][k][c] *
+                    tvm.sum(U[eps][nu][c][k] *
                             V[eps][nu][c][b], axis=c), name='M')
 
     # inverse transform and unpack
@@ -133,9 +133,9 @@ def schedule_smem_load(s, smem, num_thread):
     yi, xi, ci, ni = s[smem].op.axis
     ty, ci = s[smem].split(ci, nparts=num_thread)
     tx, ni = s[smem].split(ni, nparts=num_thread)
-    #_, ni = s[smem].split(ni, factor=4)
-    #s[smem].reorder(ty, tx, yi, xi, ci, ni)
-    #s[smem].vectorize(ni)  # vectorize memory load
+    _, ni = s[smem].split(ni, factor=4)
+    s[smem].reorder(ty, tx, yi, xi, ci, ni)
+    s[smem].vectorize(ni)  # vectorize memory load
     s[smem].bind(ty, tvm.thread_axis("threadIdx.y"))
     s[smem].bind(tx, tvm.thread_axis("threadIdx.x"))
 
@@ -255,10 +255,10 @@ def transform_filter(w_np):
         [0, 0, 1],
     ], w_np.dtype)
 
-    out = np.empty((4, 4, num_filter, in_channel), w_np.dtype)
-    for i in range(num_filter):
-        for j in range(in_channel):
-            out[:, :, i, j] = np.dot(G, np.dot(w_np[i, j], G.transpose()))
+    out = np.empty((4, 4, in_channel, num_filter), w_np.dtype)
+    for i in range(in_channel):
+        for j in range(num_filter):
+            out[:, :, i, j] = np.dot(G, np.dot(w_np[j, i], G.transpose()))
     return out
 
 
@@ -267,7 +267,7 @@ def test_winograd(batch, in_channel, in_size, num_filter, kernel, stride, paddin
 
     A = tvm.placeholder((batch, in_channel, in_height, in_width), name='A')
     W = tvm.placeholder((num_filter, in_channel, kernel, kernel), name='W')
-    U = tvm.placeholder((4, 4, num_filter, in_channel), name='W')
+    U = tvm.placeholder((4, 4, in_channel, num_filter), name='W')
 
     a_shape = util.get_const_tuple(A.shape)
     w_shape = util.get_const_tuple(W.shape)
@@ -311,7 +311,7 @@ def test_winograd(batch, in_channel, in_size, num_filter, kernel, stride, paddin
 
 # for copy paste as markdown
 def generate_table(workloads, wino_times, direct_times, lib_times, lib_name):
-    print("| (batch,CI,size,CO) | TVM Winograd | TVM Direct | %s |" % lib_name)
+    print("| (batch,CI,size,CO) | TVM Winograd (This code) | TVM Direct | %s |" % lib_name)
     print("|------------- |:-------------:|:-------------:|:-------------:|")
     for (workload, t_wino, t_direct, t_lib) in zip(workloads, wino_times, direct_times, lib_times):
         if t_direct:
@@ -321,11 +321,14 @@ def generate_table(workloads, wino_times, direct_times, lib_times, lib_name):
 
 
 workloads = [(1, 128, 122, 128),
+             (1, 128, 128, 128),
              (1, 64, 56, 64),
              (1, 64, 64, 32),
              (1, 64, 224, 64),
              (1, 64, 112, 128),
              (1, 512, 28, 512),
+             (1, 128, 28, 128),
+             (1, 256, 14, 256),
              (8, 128, 122, 128),
              (16, 64, 56, 64),
              (32, 64, 64, 32),
@@ -335,10 +338,11 @@ workloads = [(1, 128, 122, 128),
 wino_times = []
 direct_times = []
 lib_times = []
+libs = {"cuda":"cudnn", "rocm":"miopen"}
 
 for workload in workloads:
-    #device = "cuda"
-    device = "rocm"
+    device = "cuda"
+    #device = "rocm"
     t_wino = test_winograd(*workload, 3, 1, 1, device)
 
     if workload[1] == 512 or workload[0] > 1 or (workload[1] == 128 and device == "rocm"):
@@ -346,8 +350,7 @@ for workload in workloads:
     else:
         t_direct = reference_direct(*workload, 3, 1, 1, device)
 
-    # device += " -libs=cudnn"
-    device += " -libs=miopen"
+    device += " -libs=%s" % libs[device]
     t_lib = reference_direct(*workload, 3, 1, 1, device)
 
     print(t_wino, t_direct)
