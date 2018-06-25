@@ -4,7 +4,7 @@ TVM Direct convolution cannot handle specific inputs shape. These are denoted as
 
 ## R9 Nano
 
-| (batch,CI,size,CO) | TVM Winograd | TVM Direct | MIOpen Winograd |
+| (batch,CI,size,CO) | TVM Winograd (This code) | TVM Direct | MIOpen Winograd |
 |------------- |:-------------:|:-------------:|:-------------:|
 | (1, 128, 122, 128) | 1.288 | N/A | 0.432
 | (1, 64, 56, 64) | 0.145 | 0.351 | 0.044
@@ -16,3 +16,20 @@ TVM Direct convolution cannot handle specific inputs shape. These are denoted as
 | (16, 64, 56, 64) | 1.476 | N/A | 0.376
 | (32, 64, 64, 32) | 5.741 | N/A | 0.473
 | (64, 128, 32, 128) | 6.842 | N/A | 2.244
+
+<br/>
+
+## GTX1070 Ti
+
+| (batch,CI,size,CO) | TVM Winograd (This code) | TVM Direct | CUDNN Winograd |
+|------------- |:-------------:|:-------------:|:-------------:|
+| (1, 128, 122, 128) | 1.780 | 2.296 | 0.414
+| (1, 64, 56, 64) | 0.178 | 0.168 | 0.051
+| (1, 64, 64, 32) | 0.121 | 0.481 | 0.037
+| (1, 64, 224, 64) | 1.330 | 1.847 | 0.364
+| (1, 64, 112, 128) | 0.875 | 1.304 | 0.198
+| (1, 512, 28, 512) | 1.361 | N/A | 0.562
+| (8, 128, 122, 128) | 12.437 | N/A | 3.234
+| (16, 64, 56, 64) | 1.935 | N/A | 0.392
+| (32, 64, 64, 32) | 2.915 | N/A | 0.567
+| (64, 128, 32, 128) | 4.257 | N/A | 1.584
