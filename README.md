@@ -1,1 +1,18 @@
-Implements winograd convolution in TVM. Work in progress.
+All numbers in msec.
+
+TVM Direct convolution cannot handle specific inputs shape. These are denoted as N/A.
+
+## R9 Nano
+
+| (batch,CI,size,CO) | TVM Winograd | TVM Direct | MIOpen Winograd |
+|------------- |:-------------:|:-------------:|:-------------:|
+| (1, 128, 122, 128) | 1.288 | N/A | 0.432
+| (1, 64, 56, 64) | 0.145 | 0.351 | 0.044
+| (1, 64, 64, 32) | 0.163 | 0.742 | 0.044
+| (1, 64, 224, 64) | 1.350 | 1.864 | 0.371
+| (1, 64, 112, 128) | 0.698 | 1.128 | 0.206
+| (1, 512, 28, 512) | 2.145 | N/A | 0.422
+| (8, 128, 122, 128) | 10.229 | N/A | 4.200
+| (16, 64, 56, 64) | 1.476 | N/A | 0.376
+| (32, 64, 64, 32) | 5.741 | N/A | 0.473
+| (64, 128, 32, 128) | 6.842 | N/A | 2.244
