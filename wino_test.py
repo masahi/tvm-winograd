@@ -212,4 +212,4 @@ def test(batch, in_channel, in_size, num_filter, device):
 device = "cuda"
 workload = (1, 64, 224, 64)
 t_wino, t_direct = test(*workload, device)
-print("Winograd: %f msec, Reference: %f msec" % (t_wino, t_direct))
+print("Winograd: %f msec, Reference: %f msec" % (t_wino * 1000, t_direct * 1000))
