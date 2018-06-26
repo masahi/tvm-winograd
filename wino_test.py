@@ -202,7 +202,7 @@ def test(batch, in_channel, in_size, num_filter, device):
         np.testing.assert_allclose(b.asnumpy(), b_np, rtol=1e-5)
         timer = func.time_evaluator(func.entry_name, ctx, number=num_runs)
         t_wino = timer(a, u, b).mean
-        #print(tvm.lower(s_wino, [A, U, B], simple_mode=True))
+        #print(tvm.lower(s_wino, [A, U, B_wino], simple_mode=True))
         return t_wino, t_direct
 
 device = "cuda"
