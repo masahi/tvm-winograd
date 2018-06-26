@@ -103,9 +103,8 @@ def schedule_winograd(outs):
 
     # transform image
     s[B].compute_inline()
-    r_eps, r_nu = s[V].op.reduce_axis
+    VL = s.cache_write(V, "local")
     eps, nu, p, c = s[V].op.axis
-    s[V].reorder(eps, nu, p, c, r_nu, r_eps)
     po, pi = s[V].split(p, factor=num_thread)
     co, ci = s[V].split(c, factor=num_thread)
     s[V].reorder(eps, nu, po, co, pi, ci)
@@ -113,9 +112,10 @@ def schedule_winograd(outs):
     s[V].bind(pi, tvm.thread_axis("threadIdx.y"))
     s[V].bind(ci, tvm.thread_axis("threadIdx.x"))
     s[V].bind(fused, tvm.thread_axis("blockIdx.x"))
+    s[VL].compute_at(s[V], ci)
 
+    ML = s.cache_write(M, "local")
     eps, nu, k, p = s[M].op.axis
-    c = s[M].op.reduce_axis[0]
     ko, ki = s[M].split(k, factor=num_thread)
     po, pi = s[M].split(p, factor=num_thread)
     z = s[M].fuse(eps, nu)
@@ -124,9 +124,11 @@ def schedule_winograd(outs):
     s[M].bind(ko, tvm.thread_axis("blockIdx.y"))
     s[M].bind(po, tvm.thread_axis("blockIdx.x"))
     s[M].bind(z, tvm.thread_axis("blockIdx.z"))
+    s[ML].compute_at(s[M], pi)
 
     # inverse transform
     s[A].compute_inline()
+    output_L = s.cache_write(output, "local")
     n, k, h, w = s[output].op.axis
     ho, hi = s[output].split(h, factor=num_thread)
     wo, wi = s[output].split(w, factor=num_thread)
@@ -135,6 +137,7 @@ def schedule_winograd(outs):
     s[output].bind(hi, tvm.thread_axis("threadIdx.y"))
     s[output].bind(wi, tvm.thread_axis("threadIdx.x"))
     s[output].bind(fused, tvm.thread_axis("blockIdx.x"))
+    s[output_L].compute_at(s[output], wi)
 
     return s
 
