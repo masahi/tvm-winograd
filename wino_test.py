@@ -114,6 +114,8 @@ def schedule_winograd(outs):
     s[VL].compute_at(s[V], ci)
     s[d].compute_at(s[V], ci)
 
+    UU = s.cache_read(U, 'shared', [M])
+    VV = s.cache_read(V, "shared", [M])
     ML = s.cache_write(M, "local")
     eps, nu, k, p = s[M].op.axis
     ko, ki = s[M].split(k, factor=num_thread)
@@ -125,6 +127,23 @@ def schedule_winograd(outs):
     s[M].bind(po, tvm.thread_axis("blockIdx.x"))
     s[M].bind(z, tvm.thread_axis("blockIdx.z"))
     s[ML].compute_at(s[M], pi)
+
+    k = s[ML].op.reduce_axis[0]
+    ko, ki = s[ML].split(k, factor=num_thread)
+    s[UU].compute_at(s[ML], ko)
+    s[VV].compute_at(s[ML], ko)
+
+    yi, xi, ci, ni = s[UU].op.axis
+    ty, ci = s[UU].split(ci, nparts=num_thread)
+    tx, ni = s[UU].split(ni, nparts=num_thread)
+    s[UU].bind(ty, tvm.thread_axis("threadIdx.y"))
+    s[UU].bind(tx, tvm.thread_axis("threadIdx.x"))
+
+    yi, xi, ci, ni = s[VV].op.axis
+    ty, ci = s[VV].split(ci, nparts=num_thread)
+    tx, ni = s[VV].split(ni, nparts=num_thread)
+    s[VV].bind(ty, tvm.thread_axis("threadIdx.y"))
+    s[VV].bind(tx, tvm.thread_axis("threadIdx.x"))
 
     # inverse transform
     s[A].compute_inline()
