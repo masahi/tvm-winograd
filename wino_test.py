@@ -64,10 +64,9 @@ def decl_winograd(data, U, stride, padding, out_dtype):
                              tvm.select(b < P, data_pad[b // (nH*nW)][c][b// nW % nH * m + eps][b % nW * m + nu], tvm.const(0, data_pad.dtype)), name='d')
 
     # transform image
-
     r_eps = tvm.reduce_axis((0, alpha), 'r_eps')
     r_nu = tvm.reduce_axis((0, alpha), 'r_nu')
-    V = tvm.compute((alpha, alpha, P, C), lambda eps, nu, b, c:
+    V = tvm.compute((alpha, alpha, C, P), lambda eps, nu, c, b:
                     tvm.sum(input_tile[c][b][r_eps][r_nu] * B[r_eps][eps] * B[r_nu][nu],
                             axis=[r_eps, r_nu]), name='V')
 
@@ -75,7 +74,7 @@ def decl_winograd(data, U, stride, padding, out_dtype):
     c = tvm.reduce_axis((0, C), name='c')
     M = tvm.compute((alpha, alpha, K, P), lambda eps, nu, k, b:
                     tvm.sum(U[eps][nu][k][c] *
-                            V[eps][nu][b][c], axis=c), name='M')
+                            V[eps][nu][c][b], axis=c), name='M')
 
     # inverse transform and unpack
     r_eps = tvm.reduce_axis((0, alpha), 'r_eps')
@@ -103,16 +102,16 @@ def schedule_winograd(outs):
     # transform image
     s[B].compute_inline()
     VL = s.cache_write(V, "local")
-    eps, nu, p, c = s[V].op.axis
-    s[V].reorder(p, c, eps, nu)
-    po, pi = s[V].split(p, factor=num_thread)
+    eps, nu, c, p = s[V].op.axis
+    s[V].reorder(c, p, eps, nu)
     co, ci = s[V].split(c, factor=num_thread)
-    s[V].bind(pi, tvm.thread_axis("threadIdx.y"))
-    s[V].bind(ci, tvm.thread_axis("threadIdx.x"))
-    s[V].bind(po, tvm.thread_axis("blockIdx.y"))
-    s[V].bind(co, tvm.thread_axis("blockIdx.x"))
-    s[VL].compute_at(s[V], ci)
-    s[d].compute_at(s[V], ci)
+    po, pi = s[V].split(p, factor=num_thread)
+    s[V].bind(ci, tvm.thread_axis("threadIdx.y"))
+    s[V].bind(pi, tvm.thread_axis("threadIdx.x"))
+    s[V].bind(co, tvm.thread_axis("blockIdx.y"))
+    s[V].bind(po, tvm.thread_axis("blockIdx.x"))
+    s[VL].compute_at(s[V], pi)
+    s[d].compute_at(s[V], pi)
 
     UU = s.cache_read(U, 'shared', [M])
     VV = s.cache_read(V, "shared", [M])
