@@ -26,7 +26,7 @@ def const_array(data, name):
 
 def decl_winograd(data, U, stride, padding, out_dtype):
     N, CI, H, W = [util.get_const_int(x) for x in data.shape]
-    _, _, CO, CI = [util.get_const_int(x) for x in U.shape]
+    _, _, CI, CO = [util.get_const_int(x) for x in U.shape]
     HPAD, WPAD = 1,1
     HSTR, WSTR = 1,1
 
@@ -73,7 +73,7 @@ def decl_winograd(data, U, stride, padding, out_dtype):
     # batch gemm
     c = tvm.reduce_axis((0, C), name='c')
     M = tvm.compute((alpha, alpha, K, P), lambda eps, nu, k, b:
-                    tvm.sum(U[eps][nu][k][c] *
+                    tvm.sum(U[eps][nu][c][k] *
                             V[eps][nu][c][b], axis=c), name='M')
 
     # inverse transform and unpack
@@ -83,6 +83,68 @@ def decl_winograd(data, U, stride, padding, out_dtype):
                     tvm.sum(M[r_eps][r_nu][k][n * nH * nW + (h//m) * nW + w//m] * A[r_eps][h % m] * A[r_nu][w % m],
                             axis=[r_eps, r_nu]), name='output')
     return output
+
+def schedule_smem_load(s, smem, num_thread):
+    yi, xi, ci, ni = s[smem].op.axis
+    ty, ci = s[smem].split(ci, nparts=num_thread)
+    tx, ni = s[smem].split(ni, nparts=num_thread)
+    _, ni = s[smem].split(ni, factor=4)
+    s[smem].reorder(ty, tx, yi, xi, ci, ni)
+    s[smem].vectorize(ni)
+    s[smem].bind(ty, tvm.thread_axis("threadIdx.y"))
+    s[smem].bind(tx, tvm.thread_axis("threadIdx.x"))
+
+def schedule_batched_sgemm(s, U, V, M):
+    UU = s.cache_read(U, 'shared', [M])
+    VV = s.cache_read(V, "shared", [M])
+    UL = s.cache_read(UU, "local", [M])
+    VL = s.cache_read(VV, "local", [M])
+    ML = s.cache_write(M, "local")
+
+    tile = 8
+    num_thread = 8
+    block_factor = tile * num_thread
+    step = 8
+    vthread = 2
+
+    thread_x = tvm.thread_axis((0, num_thread), "threadIdx.x")
+    thread_y = tvm.thread_axis((0, num_thread), "threadIdx.y")
+    thread_xz = tvm.thread_axis((0, vthread), "vthread", name="vx")
+    thread_yz = tvm.thread_axis((0, vthread), "vthread", name="vy")
+
+    eps, nu, k, p = s[M].op.axis
+    ko, ki = s[M].split(k, factor=block_factor)
+    po, pi = s[M].split(p, factor=block_factor)
+    z = s[M].fuse(eps, nu)
+
+    s[M].bind(z, tvm.thread_axis("blockIdx.z"))
+    s[M].bind(ko, tvm.thread_axis("blockIdx.y"))
+    s[M].bind(po, tvm.thread_axis("blockIdx.x"))
+
+    tyz, kii = s[M].split(ki, nparts=vthread)  # virtual thread split
+    txz, pii = s[M].split(pi, nparts=vthread)  # virtual thread split
+    ty, kii = s[M].split(kii, nparts=num_thread)
+    tx, pii = s[M].split(pii, nparts=num_thread)
+    s[M].reorder(z, ko, po, tyz, txz, ty, tx, kii, pii)
+
+    s[M].bind(tyz, thread_yz)
+    s[M].bind(txz, thread_xz)
+    s[M].bind(ty, thread_y)
+    s[M].bind(tx, thread_x)
+
+    s[ML].compute_at(s[M], tx)
+    eps, nu, k, p = s[ML].op.axis
+    c = s[ML].op.reduce_axis[0]
+    co, ci = s[ML].split(c, factor=step)
+    s[ML].reorder(co, ci, k, p)
+
+    s[UU].compute_at(s[ML], co)
+    s[VV].compute_at(s[ML], co)
+    s[UL].compute_at(s[ML], ci)
+    s[VL].compute_at(s[ML], ci)
+
+    schedule_smem_load(s, UU, num_thread)
+    schedule_smem_load(s, VV, num_thread)
 
 def schedule_winograd(outs):
     s = tvm.create_schedule([x.op for x in outs])
@@ -113,36 +175,7 @@ def schedule_winograd(outs):
     s[VL].compute_at(s[V], pi)
     s[d].compute_at(s[V], pi)
 
-    UU = s.cache_read(U, 'shared', [M])
-    VV = s.cache_read(V, "shared", [M])
-    ML = s.cache_write(M, "local")
-    eps, nu, k, p = s[M].op.axis
-    ko, ki = s[M].split(k, factor=num_thread)
-    po, pi = s[M].split(p, factor=num_thread)
-    z = s[M].fuse(eps, nu)
-    s[M].bind(ki, tvm.thread_axis("threadIdx.y"))
-    s[M].bind(pi, tvm.thread_axis("threadIdx.x"))
-    s[M].bind(ko, tvm.thread_axis("blockIdx.y"))
-    s[M].bind(po, tvm.thread_axis("blockIdx.x"))
-    s[M].bind(z, tvm.thread_axis("blockIdx.z"))
-    s[ML].compute_at(s[M], pi)
-
-    k = s[ML].op.reduce_axis[0]
-    ko, ki = s[ML].split(k, factor=num_thread)
-    s[UU].compute_at(s[ML], ko)
-    s[VV].compute_at(s[ML], ko)
-
-    yi, xi, ci, ni = s[UU].op.axis
-    ty, ci = s[UU].split(ci, nparts=num_thread)
-    tx, ni = s[UU].split(ni, nparts=num_thread)
-    s[UU].bind(ty, tvm.thread_axis("threadIdx.y"))
-    s[UU].bind(tx, tvm.thread_axis("threadIdx.x"))
-
-    yi, xi, ci, ni = s[VV].op.axis
-    ty, ci = s[VV].split(ci, nparts=num_thread)
-    tx, ni = s[VV].split(ni, nparts=num_thread)
-    s[VV].bind(ty, tvm.thread_axis("threadIdx.y"))
-    s[VV].bind(tx, tvm.thread_axis("threadIdx.x"))
+    schedule_batched_sgemm(s, U, V, M)
 
     # inverse transform
     s[A].compute_inline()
@@ -175,10 +208,10 @@ def transform_filter(w_np):
         [0, 0, 1],
     ], w_np.dtype)
 
-    out = np.empty((4, 4, num_filter, in_channel), w_np.dtype)
-    for i in range(num_filter):
-        for j in range(in_channel):
-            out[:, :, i, j] = np.dot(G, np.dot(w_np[i, j], G.transpose()))
+    out = np.empty((4, 4, in_channel, num_filter), w_np.dtype)
+    for i in range(in_channel):
+        for j in range(num_filter):
+            out[:, :, i, j] = np.dot(G, np.dot(w_np[j, i], G.transpose()))
     return out
 
 def test(batch, in_channel, in_size, num_filter, device):
@@ -186,7 +219,7 @@ def test(batch, in_channel, in_size, num_filter, device):
     kernel = 3
     A = tvm.placeholder((batch, in_channel, in_height, in_width), name='A')
     W = tvm.placeholder((num_filter, in_channel, kernel, kernel), name='W')
-    U = tvm.placeholder((4, 4, num_filter, in_channel), name='U')
+    U = tvm.placeholder((4, 4, in_channel, num_filter), name='U')
 
     a_shape = util.get_const_tuple(A.shape)
     w_shape = util.get_const_tuple(W.shape)
