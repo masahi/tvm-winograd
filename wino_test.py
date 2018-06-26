@@ -99,20 +99,20 @@ def schedule_winograd(outs):
     s[data_pad].compute_inline()
 
     num_thread = 16
-    s[d].compute_inline()
 
     # transform image
     s[B].compute_inline()
     VL = s.cache_write(V, "local")
     eps, nu, p, c = s[V].op.axis
+    s[V].reorder(p, c, eps, nu)
     po, pi = s[V].split(p, factor=num_thread)
     co, ci = s[V].split(c, factor=num_thread)
-    s[V].reorder(eps, nu, po, co, pi, ci)
-    fused = s[V].fuse(eps, nu, po, co)
     s[V].bind(pi, tvm.thread_axis("threadIdx.y"))
     s[V].bind(ci, tvm.thread_axis("threadIdx.x"))
-    s[V].bind(fused, tvm.thread_axis("blockIdx.x"))
+    s[V].bind(po, tvm.thread_axis("blockIdx.y"))
+    s[V].bind(co, tvm.thread_axis("blockIdx.x"))
     s[VL].compute_at(s[V], ci)
+    s[d].compute_at(s[V], ci)
 
     ML = s.cache_write(M, "local")
     eps, nu, k, p = s[M].op.axis
@@ -128,16 +128,23 @@ def schedule_winograd(outs):
 
     # inverse transform
     s[A].compute_inline()
-    output_L = s.cache_write(output, "local")
     n, k, h, w = s[output].op.axis
-    ho, hi = s[output].split(h, factor=num_thread)
-    wo, wi = s[output].split(w, factor=num_thread)
-    s[output].reorder(k, ho, wo, hi, wi)
-    fused = s[output].fuse(k, ho, wo)
-    s[output].bind(hi, tvm.thread_axis("threadIdx.y"))
-    s[output].bind(wi, tvm.thread_axis("threadIdx.x"))
-    s[output].bind(fused, tvm.thread_axis("blockIdx.x"))
-    s[output_L].compute_at(s[output], wi)
+    ML = s.cache_read(M, "local", [output])
+    output_L = s.cache_write(output, "local")
+    ho, hi = s[output].split(h, factor=2)
+    wo, wi = s[output].split(w, factor=2)
+    s[output].reorder(k, n, ho, wo, hi, wi)
+    k = s[output].fuse(k, n)
+
+    hoo, hoi = s[output].split(ho, factor=16)
+    woo, woi = s[output].split(wo, factor=16)
+    s[output].bind(hoi, tvm.thread_axis("threadIdx.y"))
+    s[output].bind(woi, tvm.thread_axis("threadIdx.x"))
+    s[output].bind(hoo, tvm.thread_axis("blockIdx.y"))
+    s[output].bind(woo, tvm.thread_axis("blockIdx.x"))
+    s[output].bind(k, tvm.thread_axis("blockIdx.z"))
+    s[output_L].compute_at(s[output], woi)
+    s[ML].compute_at(s[output], woi)
 
     return s
 
@@ -206,7 +213,7 @@ def test(batch, in_channel, in_size, num_filter, device):
         np.testing.assert_allclose(b.asnumpy(), b_np, rtol=1e-5)
         timer = func.time_evaluator(func.entry_name, ctx, number=num_runs)
         t_wino = timer(a, u, b).mean
-        #print(tvm.lower(s_wino, [A, U, B_wino], simple_mode=True))
+        print(tvm.lower(s_wino, [A, U, B_wino], simple_mode=True))
         return t_wino, t_direct
 
 device = "cuda"
