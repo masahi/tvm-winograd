@@ -105,13 +105,14 @@ def schedule_winograd(outs):
     s[B].compute_inline()
     r_eps, r_nu = s[V].op.reduce_axis
     eps, nu, p, c = s[V].op.axis
-    s[V].reorder(p, c, eps, nu, r_nu, r_eps)
+    s[V].reorder(eps, nu, p, c, r_nu, r_eps)
     po, pi = s[V].split(p, factor=num_thread)
     co, ci = s[V].split(c, factor=num_thread)
+    s[V].reorder(eps, nu, po, co, pi, ci)
+    fused = s[V].fuse(eps, nu, po, co)
     s[V].bind(pi, tvm.thread_axis("threadIdx.y"))
     s[V].bind(ci, tvm.thread_axis("threadIdx.x"))
-    s[V].bind(po, tvm.thread_axis("blockIdx.y"))
-    s[V].bind(co, tvm.thread_axis("blockIdx.x"))
+    s[V].bind(fused, tvm.thread_axis("blockIdx.x"))
 
     eps, nu, k, p = s[M].op.axis
     c = s[M].op.reduce_axis[0]
