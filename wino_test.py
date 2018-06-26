@@ -103,9 +103,7 @@ def schedule_winograd(outs):
 
     # transform image
     s[B].compute_inline()
-    r_eps, r_nu = s[V].op.reduce_axis
     eps, nu, p, c = s[V].op.axis
-    s[V].reorder(eps, nu, p, c, r_nu, r_eps)
     po, pi = s[V].split(p, factor=num_thread)
     co, ci = s[V].split(c, factor=num_thread)
     s[V].reorder(eps, nu, po, co, pi, ci)
@@ -115,7 +113,6 @@ def schedule_winograd(outs):
     s[V].bind(fused, tvm.thread_axis("blockIdx.x"))
 
     eps, nu, k, p = s[M].op.axis
-    c = s[M].op.reduce_axis[0]
     ko, ki = s[M].split(k, factor=num_thread)
     po, pi = s[M].split(p, factor=num_thread)
     z = s[M].fuse(eps, nu)
