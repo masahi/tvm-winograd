@@ -337,9 +337,9 @@ workloads = [(1, 128, 122, 128),
 wino_times = []
 direct_times = []
 lib_times = []
-device = "rocm"
 
 for workload in workloads:
+    device = "rocm"
     t_wino = test_winograd(*workload, 3, 1, 1, device)
 
     if workload[1] == 512 or workload[0] > 1 or workload[2] == 122:
