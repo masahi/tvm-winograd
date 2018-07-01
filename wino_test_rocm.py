@@ -296,18 +296,17 @@ def test_winograd(batch, in_channel, in_size, num_filter, kernel, stride, paddin
     u = tvm.nd.array(u_np, ctx)
     b = tvm.nd.array(np.zeros(util.get_const_tuple(B.shape), dtype=B.dtype), ctx)
     with tvm.build_config(auto_unroll_max_step=1400,
-                          unroll_explicit=(device != "cuda")):
+                          unroll_explicit=(device != "cuda"),
+                          partition_const_loop=False):
         func = tvm.build(s, [A, U, B], device)
         #print(tvm.lower(s, [A, U, B], simple_mode=True))
         func(a, u, b)
         num_runs = 100
         timer = func.time_evaluator(func.entry_name, ctx, number=num_runs)
-
         np.testing.assert_allclose(b.asnumpy(), b_np, rtol=1e-5)
-        #print(func.imported_modules[0].get_source("asm"))
-        #print(func.get_source("llvm"))
         return timer(a, u, b).mean
 
+        #print(func.get_source("llvm"))
 
 # for copy paste as markdown
 def generate_table(workloads, wino_times, direct_times, lib_times, lib_name):
@@ -338,22 +337,18 @@ workloads = [(1, 128, 122, 128),
 wino_times = []
 direct_times = []
 lib_times = []
-libs = {"cuda":"cudnn", "rocm":"miopen"}
+device = "rocm"
 
 for workload in workloads:
-    device = "cuda"
-    #device = "rocm"
     t_wino = test_winograd(*workload, 3, 1, 1, device)
 
-    if workload[1] == 512 or workload[0] > 1 or (workload[1] == 128 and device == "rocm"):
+    if workload[1] == 512 or workload[0] > 1 or workload[2] == 122:
         t_direct = None # tvm direct conv2d cannot handle this workload
     else:
         t_direct = reference_direct(*workload, 3, 1, 1, device)
 
-    device += " -libs=%s" % libs[device]
+    device = "rocm -libs=miopen"
     t_lib = reference_direct(*workload, 3, 1, 1, device)
-
-    print(t_wino, t_direct)
 
     wino_times.append(t_wino * 1000)
     lib_times.append(t_lib * 1000)
