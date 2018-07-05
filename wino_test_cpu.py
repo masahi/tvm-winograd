@@ -104,7 +104,7 @@ def decl_winograd(data, kernel, stride, padding, out_dtype):
     nH, nW = (H + m-1) // m, (W + m-1) // m
     P = N * nH * nW
 
-    bna, bnb = 4, 4
+    bna, bnb = 8, 8
     if data.dtype == 'float16':
         bnb *= 2
     P_round = (P + bnb - 1) // bnb * bnb
@@ -133,7 +133,7 @@ def decl_winograd(data, kernel, stride, padding, out_dtype):
     V = tvm.compute((alpha, alpha, P_round // bnb, C, bnb), lambda eps, nu, b, c, bb:
                     tvm.sum(input_tile[c][b][r_eps][r_nu][bb] * B[r_eps][eps] * B[r_nu][nu],
                             axis=[r_eps, r_nu]), name='V')
-
+p
     # batch gemm
     c = tvm.reduce_axis((0, C), name='c')
     M = tvm.compute((alpha, alpha, K, P_round), lambda eps, nu, k, b:
@@ -144,6 +144,17 @@ def decl_winograd(data, kernel, stride, padding, out_dtype):
     A = const_array(A_data, 'A')
     r_eps = tvm.reduce_axis((0, alpha), 'r_eps')
     r_nu = tvm.reduce_axis((0, alpha), 'r_nu')
+    # Y = tvm.compute((K, P, m, m), lambda k, b, vh, vw:
+    #                 tvm.sum(M[r_eps][r_nu][k][b] * A[r_eps][vh] * A[r_nu][vw],
+    #                         axis=[r_eps, r_nu]), name='Y')
+
+    # # unpack output
+    # output = tvm.compute((N, K, H, W), lambda n, k, h, w:
+    #                      Y[k][n * nH * nW + (h//m) * nW + w//m][h % m][w % m]
+    #                      name='output', tag='winograd_conv_output')
+
+    # return output
+
     output = tvm.compute((N, K, H, W), lambda n, k, h, w:
                     tvm.sum(M[r_eps][r_nu][k][n * nH * nW + (h//m) * nW + w//m] * A[r_eps][h % m] * A[r_nu][w % m],
                             axis=[r_eps, r_nu]), name='output')
@@ -155,7 +166,7 @@ def schedule_winograd(outs):
     s = tvm.create_schedule([x.op for x in outs])
     op = outs[0].op
     output = op.output(0)
-
+#    Y = op.input_tensors[0]
     M, A = s[output].op.input_tensors
     U, V = s[M].op.input_tensors
     kernel, G = s[U].op.input_tensors
@@ -193,26 +204,31 @@ def schedule_winograd(outs):
     s[V].parallel(fused)
 
     # batch gemm
-    bna, bnb = 4, 4
-    if data.dtype == 'float16':
-        bnb *= 2
-
+    bna, bnb = 8, 8
     eps, nu, k, b = s[M].op.axis
     c = s[M].op.reduce_axis[0]
+    #MM = s.cache_write(M, 'global')
     yo, xo, yi, xi = s[M].tile(k, b, bna, bnb)
-    s[M].reorder(c, yi, xi)
-    c, c_unroll = s[M].split(c, 2)
-    s[M].unroll(c_unroll)
-    s[M].unroll(yi)
+    fused = s[M].fuse(eps, nu, yo, xo)
+    s[M].parallel(fused)
+    #s[MM].compute_at(s[M], fused)
+    co, ci = s[M].split(c, factor=8)
+    #_, _, yi, xi = s[MM].op.axis
+    s[M].reorder(co, yi, ci, xi)
+    s[M].unroll(ci)
     s[M].vectorize(xi)
-    z = s[M].fuse(eps, nu)
-    s[M].parallel(z)
 
     # inverse transform
     s[A].compute_inline()
     n, k, h, w = s[output].op.axis
-    fused = s[output].fuse(n, k)
+ #   output_L = s.cache_write(output, "global")
+    ho, hi = s[output].split(h, factor=2)
+    wo, wi = s[output].split(w, factor=2)
+    s[output].reorder(n, k, ho, wo, hi, wi)
+
+    fused = s[output].fuse(n, k, ho, wo)
     s[output].parallel(fused)
+#    s[output_L].compute_at(s[output], fused)
 
     return s
 
@@ -266,9 +282,10 @@ def test_winograd(batch, in_channel, in_size, num_filter, kernel, stride, paddin
     w = tvm.nd.array(w_np, ctx)
     b = tvm.nd.array(np.zeros(util.get_const_tuple(B.shape), dtype=B.dtype), ctx)
     with tvm.build_config(auto_unroll_max_step=1400,
-                          unroll_explicit=False):
+                          unroll_explicit=True):
         func = tvm.build(s, [A, W, B], device)
         func(a, w, b)
+        #print(tvm.lower(s, [A, W, B], simple_mode=True))
         num_runs = 100
         timer = func.time_evaluator(func.entry_name, ctx, number=num_runs)
         np.testing.assert_allclose(b.asnumpy(), b_np, rtol=1e-5)
