@@ -282,7 +282,7 @@ def generate_table(workloads, wino_times, direct_times):
         print("|", workload, "| %.3f | %.3f |" % (t_wino,  t_direct))
 
 
-workloads = [(1, 128, 122, 128),
+workloads1 = [(1, 128, 122, 128),
              (1, 64, 56, 64),
              (1, 64, 64, 32),
              (1, 64, 224, 64),
@@ -292,9 +292,27 @@ workloads = [(1, 128, 122, 128),
              (1, 256, 14, 256),
             ]
 
+workloads2 = [(1, 3, 128, 32),
+              (1, 32, 128, 16),
+              (1, 16, 128, 8),
+              (1, 8, 128, 16),
+              (1, 16, 128, 32),
+              (1, 32, 64, 32),
+              (1, 32, 64, 64),
+              (1, 64, 32, 64),
+              (1, 64, 16, 64),
+              (1, 64, 8, 64),
+              (1, 128, 16, 64),
+              (1, 128, 32, 64),
+              (1, 96, 64, 32),
+              (1, 40, 128, 16),
+              (1, 16, 128, 16)
+             ]
+
 wino_times = []
 direct_times = []
 device = "llvm"
+workloads = workloads2
 
 for workload in workloads:
     print(workload)
