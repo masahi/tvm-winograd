@@ -221,8 +221,8 @@ def decl_M(data, kernel, U, V, stride, padding, out_dtype):
     # batch gemm
     c = tvm.reduce_axis((0, C), name='c')
     M = tvm.compute((K // bna, P_round //bnb, alpha, alpha, bna, bnb), lambda k, b, eps, nu, kk, bb:
-                    tvm.sum(U[k][c // bnb][eps][nu][k % bna][c % bnb] *
-                            V[b][c // bna][eps][nu][b % bnb][c % bna], axis=c), name='M')
+                    tvm.sum(U[k][c // bnb][eps][nu][kk][c % bnb] *
+                            V[b][c // bna][eps][nu][bb][c % bna], axis=c), name='M')
 
     outs = [M]
     s = tvm.create_schedule([x.op for x in outs])
@@ -379,27 +379,26 @@ def decl_winograd(data, kernel, stride, padding, out_dtype):
     M = tvm.compute((K // bna, P_round //bnb, alpha, alpha, bna, bnb), lambda k, b, eps, nu, kk, bb:
                     tvm.sum(U[k][c // bnb][eps][nu][kk][c % bnb] *
                             V[b][c // bna][eps][nu][bb][c % bna], axis=c), name='M')
-    print(U.shape, U.shape, V.shape) 
-    return M
+    # print(U.shape, U.shape, V.shape) 
+    # return M
     
-    # # inverse transform
-    # A = const_array(A_data, 'A')
-    # r_eps = tvm.reduce_axis((0, alpha), 'r_eps')
-    # r_nu = tvm.reduce_axis((0, alpha), 'r_nu')
+    # inverse transform
+    A = const_array(A_data, 'A')
+    r_eps = tvm.reduce_axis((0, alpha), 'r_eps')
+    r_nu = tvm.reduce_axis((0, alpha), 'r_nu')
 
-    # output = tvm.compute((N, K, H, W), lambda n, k, h, w:
-    #                 tvm.sum(M[k//bna][(n * nH * nW + (h//m) * nW + w//m)//bna][r_eps][r_nu][k%bna][(n * nH * nW + (h//m) * nW + w//m)%bna] * A[r_eps][h % m] * A[r_nu][w % m],
-    #                         axis=[r_eps, r_nu]), name='output')
+    output = tvm.compute((N, K, H, W), lambda n, k, h, w:
+                    tvm.sum(M[k//bna][(n * nH * nW + (h//m) * nW + w//m)//bna][r_eps][r_nu][k%bna][(n * nH * nW + (h//m) * nW + w//m)%bna] * A[r_eps][h % m] * A[r_nu][w % m],
+                            axis=[r_eps, r_nu]), name='output')
     
-    # return output
+    return output
 
 
 def schedule_winograd(outs):
     s = tvm.create_schedule([x.op for x in outs])
     op = outs[0].op
     output = op.output(0)
-    M = output
-    # M, A = s[output].op.input_tensors
+    M, A = s[output].op.input_tensors
     U, V = s[M].op.input_tensors
     kernel, G = s[U].op.input_tensors
     d, B = s[V].op.input_tensors
@@ -436,7 +435,6 @@ def schedule_winograd(outs):
 
     # batch gemm
     bna, bnb = 8, 8
-
     k, b, eps, nu, kk, bb = s[M].op.axis
     c = s[M].op.reduce_axis[0]
     #MM = s.cache_write(M, 'global')
@@ -450,15 +448,15 @@ def schedule_winograd(outs):
     s[M].vectorize(xi)
 
 #     # inverse transform
-#     s[A].compute_inline()
-#     n, k, h, w = s[output].op.axis
-#  #   output_L = s.cache_write(output, "global")
-#     ho, hi = s[output].split(h, factor=2)
-#     wo, wi = s[output].split(w, factor=2)
-#     s[output].reorder(n, k, ho, wo, hi, wi)
-#     fused = s[output].fuse(n, k, ho, wo)
-#     s[output].parallel(fused)
-# #    s[output_L].compute_at(s[output], fused)
+    s[A].compute_inline()
+    n, k, h, w = s[output].op.axis
+ #   output_L = s.cache_write(output, "global")
+    ho, hi = s[output].split(h, factor=2)
+    wo, wi = s[output].split(w, factor=2)
+    s[output].reorder(n, k, ho, wo, hi, wi)
+    fused = s[output].fuse(n, k, ho, wo)
+    s[output].parallel(fused)
+#    s[output_L].compute_at(s[output], fused)
 
     return s
 
@@ -538,50 +536,34 @@ def test_components(batch, in_channel, in_size, num_filter, kernel, stride, padd
     num_runs = 100
     times = {}
 
-    def m_ref(u, v):
-        ret = np.zeros(m_np.shape)
-        for k in range(m_np.shape[0]):
-            for b in range(m_np.shape[1]):
-                for eps in range(m_np.shape[2]):
-                    for nu in range(m_np.shape[3]):
-                        for kk in range(m_np.shape[4]):
-                            for bb in range(m_np.shape[5]):
-                                sm = 0
-                                for c in range(in_channel):
-                                    sm += u[k][c // bnb][eps][nu][k % bna][c % bnb] *v[b][c // bna][eps][nu][b % bnb][c % bna]
-                                ret[k, b, eps, nu, kk, bb] = sm
-        return ret
-                                
-                            
     with tvm.build_config(auto_unroll_max_step=500,
                           unroll_explicit=True):
-        func = tvm.build(s_U, [W, U_out], device)
-        func(w, u)
-        timer = func.time_evaluator(func.entry_name, ctx, number=num_runs)
+        func_kernel_transform = tvm.build(s_U, [W, U_out], device)
+        func_kernel_transform(w, u)
+        timer = func_kernel_transform.time_evaluator(func_kernel_transform.entry_name, ctx, number=num_runs)
         times["U"] = timer(w, u).mean * 1000
         
-        func = tvm.build(s_V, [A, V_out], device)
-        func(a, v)
-        timer = func.time_evaluator(func.entry_name, ctx, number=num_runs)
+        func_input_transform = tvm.build(s_V, [A, V_out], device)
+        func_input_transform(a, v)
+        timer = func_input_transform.time_evaluator(func_input_transform.entry_name, ctx, number=num_runs)
         times["V"] = timer(a, v).mean * 1000
 
-        func = tvm.build(s_M, [U, V, M_out], device)
+        func_batch_mm = tvm.build(s_M, [U, V, M_out], device)
         #print(tvm.lower(s_M, [U, V, M_out], simple_mode=True))        
-        func(u, v, m)
-        #print(m.asnumpy())
-        # mref = m_ref(u.asnumpy(), v.asnumpy())
-        # print("max diff: ", np.max(mref - m.asnumpy()))        
-        # np.testing.assert_allclose(mref, m.asnumpy(), rtol=1e-5)
+        func_batch_mm(u, v, m)
         
-        timer = func.time_evaluator(func.entry_name, ctx, number=num_runs)
+        timer = func_batch_mm.time_evaluator(func_batch_mm.entry_name, ctx, number=num_runs)
         times["M"] = timer(u, v, m).mean * 1000
         #print(tvm.lower(s_M, [A, W, U, V, M], simple_mode=True))
 
-        func = tvm.build(s_output, [M, output_out], device)
-        func(m, output_tvm)
-        timer = func.time_evaluator(func.entry_name, ctx, number=num_runs)
+        func_inverse_transform = tvm.build(s_output, [M, output_out], device)
+        func_inverse_transform(m, output_tvm)
+        timer = func_inverse_transform.time_evaluator(func_inverse_transform.entry_name, ctx, number=num_runs)
         times["output"] = timer(m, output_tvm).mean * 1000
-        #print(tvm.lower(s_output, [A, W, M, output], simple_mode=True))        
+        #print(tvm.lower(s_output, [A, W, M, output], simple_mode=True))
+        
+        np.testing.assert_allclose(output_tvm.asnumpy(), b_np, rtol=1e-5)
+        
     return times
 
 
@@ -627,8 +609,8 @@ def test_winograd(batch, in_channel, in_size, num_filter, kernel, stride, paddin
     a_np, w_np, b_np, c_np = get_ref_data()
 
     with tvm.target.create(device):
-        M = decl_winograd(A, W, stride, padding, dtype)
-        s = schedule_winograd([M])
+        B = decl_winograd(A, W, stride, padding, dtype)
+        s = schedule_winograd([B])
 
     u_np = np.zeros(util.get_const_tuple(U.shape), dtype=dtype)
     v_np = np.zeros(util.get_const_tuple(V.shape), dtype=dtype)
@@ -638,7 +620,7 @@ def test_winograd(batch, in_channel, in_size, num_filter, kernel, stride, paddin
     ctx = tvm.context(device, 0)
     a = tvm.nd.array(a_np, ctx)
     w = tvm.nd.array(w_np, ctx)
-   # b = tvm.nd.array(np.zeros(util.get_const_tuple(B.shape), dtype=B.dtype), ctx)
+    b = tvm.nd.array(np.zeros(util.get_const_tuple(B.shape), dtype=B.dtype), ctx)
     u = tvm.nd.array(u_np, ctx)
     v = tvm.nd.array(v_np, ctx)
     m = tvm.nd.array(m_np, ctx)
@@ -646,14 +628,13 @@ def test_winograd(batch, in_channel, in_size, num_filter, kernel, stride, paddin
     
     with tvm.build_config(auto_unroll_max_step=500,
                           unroll_explicit=True):
-        func = tvm.build(s, [A, W, M], device)
-        func(a, w, m)
+        func = tvm.build(s, [A, W, B], device)
+        func(a, w, b)
         #print(tvm.lower(s, [A, W, B], simple_mode=True))
         num_runs = 100
         timer = func.time_evaluator(func.entry_name, ctx, number=num_runs)
-        # print(timer(a, w, b).mean * 1000)
-        #np.testing.assert_allclose(b.asnumpy(), b_np, rtol=1e-5)
-        return timer(a, w, m).mean
+        np.testing.assert_allclose(b.asnumpy(), b_np, rtol=1e-5)
+        return timer(a, w, b).mean
 
 # for copy paste as markdown
 def generate_table(workloads, wino_times, direct_times):
@@ -714,8 +695,8 @@ workloads = workloads2
 
 for workload in workloads:
     times = test_components(*workload, 3, 1, 1, device)
-#     t_wino = test_winograd(*workload, 3, 1, 1, device)
-#     wino_times.append(t_wino * 1000)    
+    t_wino = test_winograd(*workload, 3, 1, 1, device)
+    wino_times.append(t_wino * 1000)    
 #     t_direct = reference_direct(*workload, 3, 1, 1, device)
 #     direct_times.append(t_direct * 1000)
     
