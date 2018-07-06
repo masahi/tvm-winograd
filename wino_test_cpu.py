@@ -6,6 +6,9 @@ import topi.testing
 from tvm.contrib.pickle_memoize import memoize
 from topi import util
 from topi.nn import pad
+import sys
+
+#sys.setrecursionlimit(10000)
 
 def reference_direct(batch, in_channel, in_size, num_filter, kernel, stride, padding, device):
     in_height = in_width = in_size
@@ -37,7 +40,7 @@ def reference_direct(batch, in_channel, in_size, num_filter, kernel, stride, pad
     a = tvm.nd.array(a_np, ctx)
     w = tvm.nd.array(w_np, ctx)
     b = tvm.nd.array(np.zeros(util.get_const_tuple(B.shape), dtype=B.dtype), ctx)
-    with tvm.build_config(auto_unroll_max_step=1400,
+    with tvm.build_config(auto_unroll_max_step=500,
                           unroll_explicit=True):
         func = tvm.build(s1, [A, W, B], device)
         #print(tvm.lower(s1, [A, W, B], simple_mode=True))
@@ -61,55 +64,6 @@ def const_array(data, name):
                                  now)
         return now
     return tvm.compute(data.shape, select_array, name=name)
-
-def decl_input_tile(data, kernel, stride, padding, out_dtype):
-    N, C, H, W = [util.get_const_int(x) for x in data.shape]
-    K, C, KH, KW = [util.get_const_int(x) for x in kernel.shape]
-    HPAD, WPAD = 1,1
-    if isinstance(stride, (tuple, list)):
-        HSTR, WSTR = stride
-    else:
-        HSTR, WSTR = stride, stride
-
-    assert HSTR == 1 and WSTR == 1 and HPAD == 1 and WPAD == 1
-    data_pad = pad(data, (0, 0, HPAD, WPAD), name="data_pad")
-
-    m = 2
-    r = 3
-    alpha = m + r - 1
-    K = K
-
-    nH, nW = (H + m-1) // m, (W + m-1) // m
-    P = N * nH * nW
-
-    bna, bnb = 8, 8
-    if data.dtype == 'float16':
-        bnb *= 2
-    P_round = (P + bnb - 1) // bnb * bnb
-    assert K % bna == 0 and P_round % bnb == 0
-
-    # pack input tile
-    input_tile = tvm.compute((C, P_round // bnb, alpha, alpha, bnb),
-                             lambda c, b, eps, nu, bb:
-                             tvm.select(b * bnb + bb < P,\
-                             data_pad[(b*bnb+bb) // (nH*nW)][c][(b*bnb+bb) // nW % nH * m + eps]\
-                             [(b*bnb+bb) % nW * m + nu], tvm.const(0, data_pad.dtype)),
-                             name='d')
-    outs = [input_tile]
-    s = tvm.create_schedule([x.op for x in outs])
-    op = outs[0].op
-    output = op.output(0)
-    data_pad = s[output].op.input_tensors[0]
-    s[data_pad].compute_inline()
-    d = output
-    # pack input tiles
-    c, b, eps, nu, bb = s[d].op.axis
-    s[d].reorder(eps, nu, bb)
-    s[d].unroll(bb)
-    fused = s[d].fuse(c, b)
-    s[d].parallel(fused)
-    return s
-
 
 def decl_U(data, kernel, stride, padding, out_dtype):
     N, C, H, W = [util.get_const_int(x) for x in data.shape]
@@ -166,7 +120,7 @@ def decl_U(data, kernel, stride, padding, out_dtype):
     
     return s
 
-def decl_V(data, kernel, input_tile, stride, padding, out_dtype):
+def decl_V(data, kernel,  stride, padding, out_dtype):
     """declare winograd fast convolution F(2x2, 3x3) for conv2d"""
     N, C, H, W = [util.get_const_int(x) for x in data.shape]
     K, C, KH, KW = [util.get_const_int(x) for x in kernel.shape]
@@ -199,6 +153,14 @@ def decl_V(data, kernel, input_tile, stride, padding, out_dtype):
     P_round = (P + bnb - 1) // bnb * bnb
     assert K % bna == 0 and P_round % bnb == 0
 
+    data_pad = pad(data, (0, 0, HPAD, WPAD), name="data_pad")    
+    input_tile = tvm.compute((C, P_round // bnb, alpha, alpha, bnb),
+                             lambda c, b, eps, nu, bb:
+                             tvm.select(b * bnb + bb < P,\
+                             data_pad[(b*bnb+bb) // (nH*nW)][c][(b*bnb+bb) // nW % nH * m + eps]\
+                             [(b*bnb+bb) % nW * m + nu], tvm.const(0, data_pad.dtype)),
+                             name='d')
+    
     # transform image
     B = const_array(B_data, 'B')
     r_eps = tvm.reduce_axis((0, alpha), 'r_eps')
@@ -211,14 +173,19 @@ def decl_V(data, kernel, input_tile, stride, padding, out_dtype):
     op = outs[0].op
     V = op.output(0)
     d, B = s[V].op.input_tensors
+    data_pad = s[d].op.input_tensors[0]
+    s[data_pad].compute_inline()
     s[B].compute_inline()
     eps, nu, b, c, bb = s[V].op.axis
     r_eps, r_nu = s[V].op.reduce_axis
     s[V].reorder(b, c, bb, eps, nu, r_nu, r_eps)
-    _ = [s[V].unroll(x) for x in [eps, nu, r_eps, r_nu]]
+    # _ = [s[V].unroll(x) for x in [eps, nu, r_eps, r_nu]]
     s[V].vectorize(bb)
     fused = s[V].fuse(b, c)
     s[V].parallel(fused)
+    s[d].compute_at(s[V], fused)
+    c, b, eps, nu, bb = s[d].op.axis
+    s[d].unroll(bb)
     
     return s
     
@@ -450,10 +417,7 @@ def schedule_winograd(outs):
 
     # pack input tiles
     c, b, eps, nu, bb = s[d].op.axis
-    s[d].reorder(eps, nu, bb)
     s[d].unroll(bb)
-    fused = s[d].fuse(c, b)
-    s[d].parallel(fused)
 
     # transform kernel
     s[G].compute_inline()
@@ -474,6 +438,7 @@ def schedule_winograd(outs):
     s[V].vectorize(bb)
     fused = s[V].fuse(b, c)
     s[V].parallel(fused)
+    s[d].compute_at(s[V], fused)    
 
     # batch gemm
     bna, bnb = 8, 8
@@ -539,7 +504,6 @@ def test_components(batch, in_channel, in_size, num_filter, kernel, stride, padd
 
     A = tvm.placeholder((batch, in_channel, in_height, in_width), name='A')
     W = tvm.placeholder((num_filter, in_channel, kernel, kernel), name='W')
-    input_tile = tvm.placeholder((C, P_round // bnb, alpha, alpha, bnb), name='d')
     U = tvm.placeholder((alpha, alpha, K // bna, C, bna), name='U')
     V = tvm.placeholder((alpha, alpha, P_round // bnb, C, bnb), name='V')
     M = tvm.placeholder((alpha, alpha, K, P_round), name='M')
@@ -560,46 +524,37 @@ def test_components(batch, in_channel, in_size, num_filter, kernel, stride, padd
         return a_np, w_np, b_np, c_np
 
     a_np, w_np, b_np, c_np = get_ref_data()
-    input_tile_np = np.zeros(util.get_const_tuple(input_tile.shape), dtype=dtype)
     u_np = np.zeros(util.get_const_tuple(U.shape), dtype=dtype)
     v_np = np.zeros(util.get_const_tuple(V.shape), dtype=dtype)
     m_np = np.zeros(util.get_const_tuple(M.shape), dtype=dtype)
     output_np = np.zeros(util.get_const_tuple(output.shape), dtype=dtype)
 
     with tvm.target.create(device):
-        s_input_tile = decl_input_tile(A, W, stride, padding, dtype)
         s_U = decl_U(A, W, stride, padding, dtype)
-        s_V = decl_V(A, W, input_tile, stride, padding, dtype)
+        s_V = decl_V(A, W, stride, padding, dtype)
         s_M = decl_M(A, W, U, V, stride, padding, dtype)
         s_output = decl_output(A, W, M, stride, padding, dtype)        
         
     ctx = tvm.context(device, 0)
     a = tvm.nd.array(a_np, ctx)
     w = tvm.nd.array(w_np, ctx)
-    input_tile_tvm = tvm.nd.array(input_tile_np, ctx)
     u = tvm.nd.array(u_np, ctx)
     v = tvm.nd.array(v_np, ctx)
     m = tvm.nd.array(m_np, ctx)
     output_tvm = tvm.nd.array(output_np, ctx)        
     num_runs = 100
     times = {}
-    with tvm.build_config(auto_unroll_max_step=1400,
+    with tvm.build_config(auto_unroll_max_step=500,
                           unroll_explicit=True):
-        func = tvm.build(s_input_tile, [A, W, input_tile], device)
-        func(a, w, input_tile_tvm)
-        # print(tvm.lower(s, [A, W, B], simple_mode=True))
-        timer = func.time_evaluator(func.entry_name, ctx, number=num_runs)
-        times["Input tile"] = timer(a, w, input_tile_tvm).mean * 1000
-        
         func = tvm.build(s_U, [A, W, U], device)
         func(a, w, u)
         timer = func.time_evaluator(func.entry_name, ctx, number=num_runs)
         times["U"] = timer(a, w, u).mean * 1000
         
-        func = tvm.build(s_V, [A, W, input_tile, V], device)
-        func(a, w, input_tile_tvm, v)
+        func = tvm.build(s_V, [A, W, V], device)
+        func(a, w, v)
         timer = func.time_evaluator(func.entry_name, ctx, number=num_runs)
-        times["V"] = timer(a, w, input_tile_tvm, v).mean * 1000
+        times["V"] = timer(a, w, v).mean * 1000
         
         func = tvm.build(s_M, [A, W, U, V, M], device)
         func(a, w, u, v, m)
@@ -645,7 +600,7 @@ def test_winograd(batch, in_channel, in_size, num_filter, kernel, stride, paddin
     a = tvm.nd.array(a_np, ctx)
     w = tvm.nd.array(w_np, ctx)
     b = tvm.nd.array(np.zeros(util.get_const_tuple(B.shape), dtype=B.dtype), ctx)
-    with tvm.build_config(auto_unroll_max_step=1400,
+    with tvm.build_config(auto_unroll_max_step=500,
                           unroll_explicit=True):
         func = tvm.build(s, [A, W, B], device)
         func(a, w, b)
@@ -673,21 +628,38 @@ workloads1 = [(1, 128, 122, 128),
              (1, 256, 14, 256),
             ]
 
-workloads2 = [(1, 3, 128, 32),
-              (1, 32, 128, 16),
-              (1, 16, 128, 8),
-              (1, 8, 128, 16),
-              (1, 16, 128, 32),
-              (1, 32, 64, 32),
-              (1, 32, 64, 64),
-              (1, 64, 32, 64),
-              (1, 64, 16, 64),
-              (1, 64, 8, 64),
-              (1, 128, 16, 64),
-              (1, 128, 32, 64),
-              (1, 96, 64, 32),
-              (1, 40, 128, 16),
+workloads2 = [# (1, 3, 128, 32),
+              # (1, 32, 128, 16),
+              # (1, 16, 128, 8),
+              # (1, 8, 128, 16),
+              # (1, 16, 128, 32),
+              # (1, 32, 64, 32),
+              # (1, 32, 64, 64),
+              # (1, 64, 32, 64),
+              # (1, 64, 16, 64),
+              # (1, 64, 8, 64),
+              # (1, 128, 16, 64),
+              # (1, 128, 32, 64),
+              # (1, 96, 64, 32),
+              # (1, 40, 128, 16),
               (1, 16, 128, 16)
+             ]
+
+workloads3 = [(10, 3, 128, 32),
+              (10, 32, 128, 16),
+              (10, 16, 128, 8),
+              (10, 8, 128, 16),
+              (10, 16, 128, 32),
+              (10, 32, 64, 32),
+              (10, 32, 64, 64),
+              (10, 64, 32, 64),
+              (10, 64, 16, 64),
+              (10, 64, 8, 64),
+              (10, 128, 16, 64),
+              (10, 128, 32, 64),
+              (10, 96, 64, 32),
+              (10, 40, 128, 16),
+              (10, 16, 128, 16)
              ]
 
 wino_times = []
@@ -698,16 +670,17 @@ workloads = workloads2
 for workload in workloads:
     times = test_components(*workload, 3, 1, 1, device)
     t_wino = test_winograd(*workload, 3, 1, 1, device)
-    t_direct = reference_direct(*workload, 3, 1, 1, device)
-    wino_times.append(t_wino * 1000)
-    direct_times.append(t_direct * 1000)
+    wino_times.append(t_wino * 1000)    
+    # t_direct = reference_direct(*workload, 3, 1, 1, device)
+
+    # direct_times.append(t_direct * 1000)
     
     print("Workload: ", workload)    
     for (k,v) in times.items():
         print("%s: %f" % (k, v))
     print("Total: %f" % np.sum(list(times.values())))
     print("Wino time: ", wino_times[-1])    
-    print("Direct: %f\n" % direct_times[-1])
+    # print("Direct: %f\n" % direct_times[-1])
 
 
-generate_table(workloads, wino_times, direct_times)
+#generate_table(workloads, wino_times, direct_times)
