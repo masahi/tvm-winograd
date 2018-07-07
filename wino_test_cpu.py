@@ -217,27 +217,25 @@ def decl_M(data, kernel, U, V, stride, padding, out_dtype):
 
     # batch gemm
     c = tvm.reduce_axis((0, C), name='c')
-    M = tvm.compute((K // bna, P_round //bnb, alpha, alpha, bna, bnb), lambda k, b, eps, nu, kk, bb:
-                    tvm.sum(U[k][c // bna][eps][nu][kk][c % bna] *
-                            V[c // bna][b][eps][nu][c % bna][bb], axis=c), name='M')
+    M = tvm.compute((P_round //bnb, K // bna, alpha, alpha, bnb, bna), lambda b, k, eps, nu, bb, kk:
+                    tvm.sum(V[b][c // bna][eps][nu][bb][c % bna] *
+                            U[c // bna][k][eps][nu][c % bna][kk], axis=c), name='M')
 
     outs = [M]
     s = tvm.create_schedule([x.op for x in outs])
     op = outs[0].op
     M = op.output(0)
-    k, b, eps, nu, kk, bb = s[M].op.axis
+    b, k, eps, nu, bb, kk = s[M].op.axis
     c = s[M].op.reduce_axis[0]
 
     #MM = s.cache_write(M, 'global')
-    #bo, bi = s[M].split(b, factor=8)
-    fused = s[M].fuse(k, b, eps, nu)
+    fused = s[M].fuse(b, k)
     s[M].parallel(fused)
-    # #s[MM].compute_at(s[M], fused)
+    # # #s[MM].compute_at(s[M], fused)
     co, ci = s[M].split(c, factor=8)    
-    #s[M].reorder(b, eps, nu, co, kk, ci, bb, k)
-    s[M].reorder(co, kk, ci, bb)
+    s[M].reorder(co, bb, ci, kk)
     s[M].unroll(ci)
-    s[M].vectorize(bb)
+    s[M].vectorize(kk)
 
     return M, s
 
@@ -278,22 +276,34 @@ def decl_output(data, kernel, M, stride, padding, out_dtype):
     A = const_array(A_data, 'A')
     r_eps = tvm.reduce_axis((0, alpha), 'r_eps')
     r_nu = tvm.reduce_axis((0, alpha), 'r_nu')
-    output = tvm.compute((N, K, H, W), lambda n, k, h, w:
-                    tvm.sum(M[k//bna][(n * nH * nW + (h//m) * nW + w//m)//bna][r_eps][r_nu][k%bna][(n * nH * nW + (h//m) * nW + w//m)%bna] * A[r_eps][h % m] * A[r_nu][w % m],
+
+    output = tvm.compute((N, K // bna, H, W, bna), lambda n, k, h, w, kk: 
+                    tvm.sum(M[(n * nH * nW + (h//m) * nW + w//m)//bna][k][r_eps][r_nu][(n * nH * nW + (h//m) * nW + w//m)%bna][kk] * A[r_eps][h % m] * A[r_nu][w % m],
                             axis=[r_eps, r_nu]), name='output')
+
     outs = [output]
     s = tvm.create_schedule([x.op for x in outs])
     op = outs[0].op
     output = op.output(0)
     _, A = s[output].op.input_tensors
     s[A].compute_inline()
-    n, k, h, w = s[output].op.axis
- #   output_L = s.cache_write(output, "global")
+
+    n, k, h, w, kk = s[output].op.axis
+    # #output_L = s.cache_write(output, "global")    
+    r_eps, r_nu = s[output].op.reduce_axis    
+
     ho, hi = s[output].split(h, factor=2)
     wo, wi = s[output].split(w, factor=2)
-    s[output].reorder(n, k, ho, wo, hi, wi)
+    s[output].reorder(n, k, ho, wo, hi, wi, r_eps, r_nu, kk)
+    s[output].vectorize(kk)
+    # s[output].unroll(hi)
+    # s[output].unroll(wi)    
     fused = s[output].fuse(n, k, ho, wo)
     s[output].parallel(fused)
+    
+    #s[output_L].compute_at(s[output], fused)
+    # n, k, h, w = s[output_L].op.axis
+    # s[output_L].vectorize(w)
     
     return output, s
     
@@ -472,6 +482,14 @@ def transform_filter(w_np):
             out[:, :, i, j] = np.dot(G, np.dot(w_np[j, i], G.transpose()))
     return out
 
+def nchwc_to_nchw(arr):
+    n, c, h, w, cc = arr.shape
+    channels = c * cc
+    ret = np.zeros((n, channels, h, w))
+    for i in range(channels):
+        ret[:, i] = arr[:, i//cc, :, :, i%cc]
+    return ret
+    
 def test_components(batch, in_channel, in_size, num_filter, kernel, stride, padding, device):
     in_height = in_width = in_size
     m = 2
@@ -490,11 +508,11 @@ def test_components(batch, in_channel, in_size, num_filter, kernel, stride, padd
 
     A = tvm.placeholder((batch, in_channel, in_height, in_width), name='A')
     W = tvm.placeholder((num_filter, in_channel, kernel, kernel), name='W')
-    U = tvm.placeholder((K // bna, C // bna, alpha, alpha, bna, bna), name='U')
-    V = tvm.placeholder((C // bna, P_round // bnb, alpha, alpha, bna, bnb), name='V')
-    M = tvm.placeholder((K // bna, P_round // bnb, alpha, alpha, bna, bnb), name='M')
+    U = tvm.placeholder((C // bna, K // bna, alpha, alpha, bna, bna), name='U')
+    V = tvm.placeholder((P_round // bnb, C // bna, alpha, alpha, bnb, bna), name='V')
+    M = tvm.placeholder((P_round // bnb, K // bna, alpha, alpha, bnb, bna), name='M')
 
-    output = tvm.placeholder((N, K, in_size, in_size), name='output')
+    output = tvm.placeholder((N, K // bna, in_size, in_size, bna), name='output')
 
     a_shape = util.get_const_tuple(A.shape)
     w_shape = util.get_const_tuple(W.shape)
@@ -534,15 +552,15 @@ def test_components(batch, in_channel, in_size, num_filter, kernel, stride, padd
 
     with tvm.build_config(auto_unroll_max_step=500,
                           unroll_explicit=True):
-        func_kernel_transform = tvm.build(s_U, [W, U_out], device)
-        func_kernel_transform(w, u)
-        timer = func_kernel_transform.time_evaluator(func_kernel_transform.entry_name, ctx, number=num_runs)
-        times["U"] = timer(w, u).mean * 1000
+        # func_kernel_transform = tvm.build(s_U, [W, U_out], device)
+        # func_kernel_transform(w, u)
+        # timer = func_kernel_transform.time_evaluator(func_kernel_transform.entry_name, ctx, number=num_runs)
+        # times["U"] = timer(w, u).mean * 1000
         
-        func_input_transform = tvm.build(s_V, [A, V_out], device)
-        func_input_transform(a, v)
-        timer = func_input_transform.time_evaluator(func_input_transform.entry_name, ctx, number=num_runs)
-        times["V"] = timer(a, v).mean * 1000
+        # func_input_transform = tvm.build(s_V, [A, V_out], device)
+        # func_input_transform(a, v)
+        # timer = func_input_transform.time_evaluator(func_input_transform.entry_name, ctx, number=num_runs)
+        # times["V"] = timer(a, v).mean * 1000
 
         func_batch_mm = tvm.build(s_M, [U, V, M_out], device)
         #print(tvm.lower(s_M, [U, V, M_out], simple_mode=True))        
@@ -556,9 +574,9 @@ def test_components(batch, in_channel, in_size, num_filter, kernel, stride, padd
         func_inverse_transform(m, output_tvm)
         timer = func_inverse_transform.time_evaluator(func_inverse_transform.entry_name, ctx, number=num_runs)
         times["output"] = timer(m, output_tvm).mean * 1000
-        print(tvm.lower(s_output, [A, W, M, output], simple_mode=True))
+        #print(tvm.lower(s_output, [A, W, M, output], simple_mode=True))
         
-        np.testing.assert_allclose(output_tvm.asnumpy(), b_np, rtol=1e-5)
+        #np.testing.assert_allclose(nchwc_to_nchw(output_tvm.asnumpy()), b_np, rtol=1e-5)
         
     return times
 
@@ -650,14 +668,13 @@ workloads1 = [(1, 128, 122, 128),
              (1, 256, 14, 256),
             ]
 
-workloads2 = [#(1, 3, 128, 32),
-              # (1, 32, 128, 16),
+workloads2 = [# (1, 32, 128, 16),
               # (1, 16, 128, 8),
               # (1, 8, 128, 16),
               # (1, 16, 128, 32),
               # (1, 32, 64, 32),
               # (1, 32, 64, 64),
-              #(1, 64, 32, 64),
+              # (1, 64, 32, 64),
               # (1, 64, 16, 64),
               # (1, 64, 8, 64),
               # (1, 128, 16, 64),
@@ -691,17 +708,17 @@ workloads = workloads2
 
 for workload in workloads:
     times = test_components(*workload, 3, 1, 1, device)
-    t_wino = test_winograd(*workload, 3, 1, 1, device)
-    wino_times.append(t_wino * 1000)    
-    # t_direct = reference_direct(*workload, 3, 1, 1, device)
-    # direct_times.append(t_direct * 1000)
+#     t_wino = test_winograd(*workload, 3, 1, 1, device)
+#     wino_times.append(t_wino * 1000)    
+#     t_direct = reference_direct(*workload, 3, 1, 1, device)
+#     direct_times.append(t_direct * 1000)
     
     print("Workload: ", workload)    
     for (k,v) in times.items():
         print("%s: %f" % (k, v))
     print("Total: %f" % np.sum(list(times.values())))
-    print("Wino time: ", wino_times[-1])    
-    # print("Direct: %f\n" % direct_times[-1])
+#     print("Wino time: ", wino_times[-1])    
+#     print("Direct: %f\n" % direct_times[-1])
 
 
 # generate_table(workloads, wino_times, direct_times)
