@@ -6,9 +6,6 @@ import topi.testing
 from tvm.contrib.pickle_memoize import memoize
 from topi import util
 from topi.nn import pad
-import sys
-
-#sys.setrecursionlimit(10000)
 
 def reference_direct(batch, in_channel, in_size, num_filter, kernel, stride, padding, device):
     in_height = in_width = in_size
@@ -66,7 +63,7 @@ def const_array(data, name):
     return tvm.compute(data.shape, select_array, name=name)
 
 def decl_U(data, kernel, stride, padding, out_dtype):
-    N, C, H, W = [util.get_const_int(x) for x in data.shape]
+    N, co, H, W, ci = [util.get_const_int(x) for x in data.shape]
     K, C, KH, KW = [util.get_const_int(x) for x in kernel.shape]
     HPAD, WPAD = 1,1
     if isinstance(stride, (tuple, list)):
@@ -86,17 +83,9 @@ def decl_U(data, kernel, stride, padding, out_dtype):
     m = 2
     r = 3
     alpha = m + r - 1
-    K = K
-
     nH, nW = (H + m-1) // m, (W + m-1) // m
     P = N * nH * nW
-
     bna, bnb = 8, 8
-    if data.dtype == 'float16':
-        bnb *= 2
-    P_round = (P + bnb - 1) // bnb * bnb
-    assert K % bna == 0 and P_round % bnb == 0
-
     # transform kernel
     G = const_array(G_data, 'G')
     r_kh = tvm.reduce_axis((0, KH), 'r_kh')
@@ -123,7 +112,7 @@ def decl_U(data, kernel, stride, padding, out_dtype):
 
 def decl_V(data, kernel,  stride, padding, out_dtype):
     """declare winograd fast convolution F(2x2, 3x3) for conv2d"""
-    N, C, H, W = [util.get_const_int(x) for x in data.shape]
+    N, co, H, W, ci = [util.get_const_int(x) for x in data.shape]
     K, C, KH, KW = [util.get_const_int(x) for x in kernel.shape]
     HPAD, WPAD = 1,1
     if isinstance(stride, (tuple, list)):
@@ -143,38 +132,25 @@ def decl_V(data, kernel,  stride, padding, out_dtype):
     m = 2
     r = 3
     alpha = m + r - 1
-    K = K
-
     nH, nW = (H + m-1) // m, (W + m-1) // m
     P = N * nH * nW
-
     bna, bnb = 8, 8
-    if data.dtype == 'float16':
-        bnb *= 2
-    P_round = (P + bnb - 1) // bnb * bnb
-    assert K % bna == 0 and P_round % bnb == 0
 
-    data_pad = pad(data, (0, 0, HPAD, WPAD), name="data_pad")    
-    input_tile = tvm.compute((P_round // bnb, C // bna, alpha, alpha, bnb, bna),
-                             lambda b, c, eps, nu, bb, cc:
-                             tvm.select(b * bnb + bb < P,\
-                             data_pad[(b*bnb+bb) // (nH*nW)][c*bna + cc][(b*bnb+bb) // nW % nH * m + eps]\
-                             [(b*bnb+bb) % nW * m + nu], tvm.const(0, data_pad.dtype)),
-                             name='d')
+    data_pad = pad(data, (0, 0, HPAD, WPAD, 0), name="data_pad")    
     
     # transform image
     B = const_array(B_data, 'B')
     r_eps = tvm.reduce_axis((0, alpha), 'r_eps')
     r_nu = tvm.reduce_axis((0, alpha), 'r_nu')
-    V = tvm.compute((P_round // bnb, C // bna, alpha, alpha, bnb, bna), lambda b, c, eps, nu, bb, cc:
-                    tvm.sum(input_tile[b][c][r_eps][r_nu][bb][cc] * B[r_eps][eps] * B[r_nu][nu],
+    V = tvm.compute((P // bnb, C // bna, alpha, alpha, bnb, bna), lambda b, c, eps, nu, bb, cc:
+                    tvm.sum(data_pad[(b*bnb+bb) // (nH*nW)][c][(b*bnb+bb) // nW % nH * m + r_eps][(b*bnb+bb) % nW * m + r_nu][cc] * B[r_eps][eps] * B[r_nu][nu],
                             axis=[r_eps, r_nu]), name='V')
+    
     outs = [V]
     s = tvm.create_schedule([x.op for x in outs])
     op = outs[0].op
     V = op.output(0)
-    d, B = s[V].op.input_tensors
-    data_pad = s[d].op.input_tensors[0]
+    data_pad, B = s[V].op.input_tensors
     s[data_pad].compute_inline()
     s[B].compute_inline()
     b, c, eps, nu, bb, cc = s[V].op.axis
@@ -185,16 +161,11 @@ def decl_V(data, kernel,  stride, padding, out_dtype):
     fused = s[V].fuse(b, c)
     s[V].parallel(fused)
 
-    s[d].compute_at(s[V], fused)
-    b, c, eps, nu, bb, cc = s[d].op.axis
-    s[d].unroll(cc)
-    s[d].unroll(bb)
-
     return V, s
 
 def decl_M(data, kernel, U, V, stride, padding, out_dtype):
     """declare winograd fast convolution F(2x2, 3x3) for conv2d"""
-    N, C, H, W = [util.get_const_int(x) for x in data.shape]
+    N, co, H, W, ci = [util.get_const_int(x) for x in data.shape]
     K, C, KH, KW = [util.get_const_int(x) for x in kernel.shape]
     HPAD, WPAD = 1,1
     if isinstance(stride, (tuple, list)):
@@ -207,18 +178,13 @@ def decl_M(data, kernel, U, V, stride, padding, out_dtype):
     m = 2
     r = 3
     alpha = m + r - 1
-    K = K
-
     nH, nW = (H + m-1) // m, (W + m-1) // m
     P = N * nH * nW
-
     bna, bnb = 8, 8
-    P_round = (P + bnb - 1) // bnb * bnb
-    assert K % bna == 0 and P_round % bnb == 0
 
     # batch gemm
     c = tvm.reduce_axis((0, C), name='c')
-    M = tvm.compute((P_round //bnb, K // bna, alpha, alpha, bnb, bna), lambda b, k, eps, nu, bb, kk:
+    M = tvm.compute((P //bnb, K // bna, alpha, alpha, bnb, bna), lambda b, k, eps, nu, bb, kk:
                     tvm.sum(V[b][c // bna][eps][nu][bb][c % bna] *
                             U[c // bna][k][eps][nu][c % bna][kk], axis=c), name='M')
 
@@ -240,7 +206,7 @@ def decl_M(data, kernel, U, V, stride, padding, out_dtype):
 
 def decl_output(data, kernel, M, stride, padding, out_dtype):
     """declare winograd fast convolution F(2x2, 3x3) for conv2d"""
-    N, C, H, W = [util.get_const_int(x) for x in data.shape]
+    N, co, H, W, ci = [util.get_const_int(x) for x in data.shape]
     K, C, KH, KW = [util.get_const_int(x) for x in kernel.shape]
     HPAD, WPAD = 1,1
     if isinstance(stride, (tuple, list)):
@@ -260,22 +226,14 @@ def decl_output(data, kernel, M, stride, padding, out_dtype):
     m = 2
     r = 3
     alpha = m + r - 1
-    K = K
-
     nH, nW = (H + m-1) // m, (W + m-1) // m
     P = N * nH * nW
-
     bna, bnb = 8, 8
-    if data.dtype == 'float16':
-        bnb *= 2
-    P_round = (P + bnb - 1) // bnb * bnb
-    assert K % bna == 0 and P_round % bnb == 0
 
     # inverse transform
     A = const_array(A_data, 'A')
     r_eps = tvm.reduce_axis((0, alpha), 'r_eps')
     r_nu = tvm.reduce_axis((0, alpha), 'r_nu')
-
     output = tvm.compute((N, K // bna, H, W, bna), lambda n, k, h, w, kk: 
                     tvm.sum(M[(n * nH * nW + (h//m) * nW + w//m)//bna][k][r_eps][r_nu][(n * nH * nW + (h//m) * nW + w//m)%bna][kk] * A[r_eps][h % m] * A[r_nu][w % m],
                             axis=[r_eps, r_nu]), name='output')
@@ -301,7 +259,7 @@ def decl_output(data, kernel, M, stride, padding, out_dtype):
 
 def decl_winograd(data, kernel, stride, padding, out_dtype):
     """declare winograd fast convolution F(2x2, 3x3) for conv2d"""
-    N, C, H, W = [util.get_const_int(x) for x in data.shape]
+    N, co, H, W, ci = [util.get_const_int(x) for x in data.shape]
     K, C, KH, KW = [util.get_const_int(x) for x in kernel.shape]
     HPAD, WPAD = 1,1
     if isinstance(stride, (tuple, list)):
@@ -310,7 +268,7 @@ def decl_winograd(data, kernel, stride, padding, out_dtype):
         HSTR, WSTR = stride, stride
 
     assert HSTR == 1 and WSTR == 1 and HPAD == 1 and WPAD == 1
-    data_pad = pad(data, (0, 0, HPAD, WPAD), name="data_pad")
+    data_pad = pad(data, (0, 0, HPAD, WPAD, 0), name="data_pad")
 
     B_data = np.array([
         [1, 0, 0, 0],
@@ -336,24 +294,9 @@ def decl_winograd(data, kernel, stride, padding, out_dtype):
     m = 2
     r = 3
     alpha = m + r - 1
-    K = K
-
     nH, nW = (H + m-1) // m, (W + m-1) // m
     P = N * nH * nW
-
     bna, bnb = 8, 8
-    if data.dtype == 'float16':
-        bnb *= 2
-    P_round = (P + bnb - 1) // bnb * bnb
-    assert K % bna == 0 and P_round % bnb == 0
-
-    # pack input tile
-    input_tile = tvm.compute((P_round // bnb, C // bna, alpha, alpha, bnb, bna),
-                             lambda b, c, eps, nu, bb, cc:
-                             tvm.select(b * bnb + bb < P,\
-                             data_pad[(b*bnb+bb) // (nH*nW)][c*bna + cc][(b*bnb+bb) // nW % nH * m + eps]\
-                             [(b*bnb+bb) % nW * m + nu], tvm.const(0, data_pad.dtype)),
-                             name='d')
 
     # # transform kernel
     G = const_array(G_data, 'G')
@@ -367,13 +310,13 @@ def decl_winograd(data, kernel, stride, padding, out_dtype):
     B = const_array(B_data, 'B')
     r_eps = tvm.reduce_axis((0, alpha), 'r_eps')
     r_nu = tvm.reduce_axis((0, alpha), 'r_nu')
-    V = tvm.compute((P_round // bnb, C // bna, alpha, alpha, bnb, bna), lambda b, c, eps, nu, bb, cc:
-                    tvm.sum(input_tile[b][c][r_eps][r_nu][bb][cc] * B[r_eps][eps] * B[r_nu][nu],
+    V = tvm.compute((P // bnb, C // bna, alpha, alpha, bnb, bna), lambda b, c, eps, nu, bb, cc:
+                    tvm.sum(data_pad[(b*bnb+bb) // (nH*nW)][c][(b*bnb+bb) // nW % nH * m + r_eps][(b*bnb+bb) % nW * m + r_nu][cc] * B[r_eps][eps] * B[r_nu][nu],
                             axis=[r_eps, r_nu]), name='V')
     
     # batch gemm
     c = tvm.reduce_axis((0, C), name='c')
-    M = tvm.compute((P_round //bnb, K // bna, alpha, alpha, bnb, bna), lambda b, k, eps, nu, bb, kk:
+    M = tvm.compute((P //bnb, K // bna, alpha, alpha, bnb, bna), lambda b, k, eps, nu, bb, kk:
                     tvm.sum(V[b][c // bna][eps][nu][bb][c % bna] *
                             U[c // bna][k][eps][nu][c % bna][kk], axis=c), name='M')
     
@@ -382,7 +325,6 @@ def decl_winograd(data, kernel, stride, padding, out_dtype):
     A = const_array(A_data, 'A')
     r_eps = tvm.reduce_axis((0, alpha), 'r_eps')
     r_nu = tvm.reduce_axis((0, alpha), 'r_nu')
-
     output = tvm.compute((N, K // bna, H, W, bna), lambda n, k, h, w, kk: 
                     tvm.sum(M[(n * nH * nW + (h//m) * nW + w//m)//bna][k][r_eps][r_nu][(n * nH * nW + (h//m) * nW + w//m)%bna][kk] * A[r_eps][h % m] * A[r_nu][w % m],
                             axis=[r_eps, r_nu]), name='output')
@@ -397,8 +339,7 @@ def schedule_winograd(outs):
     M, A = s[output].op.input_tensors
     V, U = s[M].op.input_tensors
     kernel, G = s[U].op.input_tensors
-    d, B = s[V].op.input_tensors
-    data_pad = s[d].op.input_tensors[0]
+    data_pad, B = s[V].op.input_tensors
     data = s[data_pad].op.input_tensors[0]
 
     s[data_pad].compute_inline()
@@ -423,11 +364,6 @@ def schedule_winograd(outs):
     _ = [s[V].unroll(x) for x in [eps, nu, r_eps, r_nu]]
     fused = s[V].fuse(b, c)
     s[V].parallel(fused)
-
-    s[d].compute_at(s[V], fused)
-    b, c, eps, nu, bb, cc = s[d].op.axis
-    s[d].unroll(cc)
-    s[d].unroll(bb)
 
     # batch gemm
     b, k, eps, nu, bb, kk = s[M].op.axis
@@ -484,18 +420,15 @@ def test_components(batch, in_channel, in_size, num_filter, kernel, stride, padd
     H = W = in_size
     N = batch
     C = in_channel
-
     nH, nW = (H + m-1) // m, (W + m-1) // m
     P = N * nH * nW
-
     bna, bnb = 8, 8
-    P_round = (P + bnb - 1) // bnb * bnb
 
-    A = tvm.placeholder((batch, in_channel, in_height, in_width), name='A')
+    A = tvm.placeholder((batch, in_channel // bna, in_height, in_width, bna), name='A')
     W = tvm.placeholder((num_filter, in_channel, kernel, kernel), name='W')
     U = tvm.placeholder((C // bna, K // bna, alpha, alpha, bna, bna), name='U')
-    V = tvm.placeholder((P_round // bnb, C // bna, alpha, alpha, bnb, bna), name='V')
-    M = tvm.placeholder((P_round // bnb, K // bna, alpha, alpha, bnb, bna), name='M')
+    V = tvm.placeholder((P // bnb, C // bna, alpha, alpha, bnb, bna), name='V')
+    M = tvm.placeholder((P // bnb, K // bna, alpha, alpha, bnb, bna), name='M')
 
     output = tvm.placeholder((N, K // bna, in_size, in_size, bna), name='output')
 
@@ -509,7 +442,7 @@ def test_components(batch, in_channel, in_size, num_filter, kernel, stride, padd
         a_np = np.random.uniform(size=a_shape).astype(dtype)
         w_np = np.random.uniform(size=w_shape).astype(dtype)
         dw_np = topi.testing.dilate_python(w_np, (1, 1, dilation, dilation))
-        b_np = topi.testing.conv2d_nchw_python(a_np, dw_np, stride, padding)
+        b_np = topi.testing.conv2d_nchw_python(nchwc_to_nchw(a_np), dw_np, stride, padding)
         c_np = np.maximum(b_np, 0)
         return a_np, w_np, b_np, c_np
 
@@ -569,22 +502,9 @@ def test_components(batch, in_channel, in_size, num_filter, kernel, stride, padd
 
 def test_winograd(batch, in_channel, in_size, num_filter, kernel, stride, padding, device):
     in_height = in_width = in_size
-
-    m = 2
-    r = 3
-    alpha = m + r - 1
-    K = num_filter
-    H = W = in_size
-    N = batch
-    C = in_channel
-
-    nH, nW = (H + m-1) // m, (W + m-1) // m
-    P = N * nH * nW
-
     bna, bnb = 8, 8
-    P_round = (P + bnb - 1) // bnb * bnb
 
-    A = tvm.placeholder((batch, in_channel, in_height, in_width), name='A')
+    A = tvm.placeholder((batch, in_channel // bna, in_height, in_width, bna), name='A')
     W = tvm.placeholder((num_filter, in_channel, kernel, kernel), name='W')
 
     a_shape = util.get_const_tuple(A.shape)
@@ -592,14 +512,14 @@ def test_winograd(batch, in_channel, in_size, num_filter, kernel, stride, paddin
     dtype = A.dtype
     dilation = 1
     
-    output = tvm.placeholder((N, K//bna, in_size, in_size, bna), name='output')
+    output = tvm.placeholder((batch, num_filter//bna, in_size, in_size, bna), name='output')
     
     @memoize("topi.tests.test_topi_conv2d_nchw.wino")
     def get_ref_data():
         a_np = np.random.uniform(size=a_shape).astype(dtype)
         w_np = np.random.uniform(size=w_shape).astype(dtype)
         dw_np = topi.testing.dilate_python(w_np, (1, 1, dilation, dilation))
-        b_np = topi.testing.conv2d_nchw_python(a_np, dw_np, stride, padding)
+        b_np = topi.testing.conv2d_nchw_python(nchwc_to_nchw(a_np), dw_np, stride, padding)
         c_np = np.maximum(b_np, 0)
         return a_np, w_np, b_np, c_np
 
@@ -634,18 +554,7 @@ def generate_table(workloads, wino_times, direct_times):
     for (workload, t_wino, t_direct) in zip(workloads, wino_times, direct_times):
         print("|", workload, "| %.3f | %.3f |" % (t_wino,  t_direct))
 
-
-workloads1 = [(1, 128, 122, 128),
-             (1, 64, 56, 64),
-             (1, 64, 64, 32),
-             (1, 64, 224, 64),
-             (1, 64, 112, 128),
-             (1, 512, 28, 512),
-             (1, 128, 28, 128),
-             (1, 256, 14, 256),
-            ]
-
-workloads2 = [# (1, 32, 128, 16),
+workloads1 = [# (1, 32, 128, 16),
               # (1, 16, 128, 8),
               # (1, 8, 128, 16),
               # (1, 16, 128, 32),
@@ -661,27 +570,14 @@ workloads2 = [# (1, 32, 128, 16),
               (1, 16, 128, 16)
              ]
 
-workloads3 = [(10, 3, 128, 32),
-              (10, 32, 128, 16),
-              (10, 16, 128, 8),
-              (10, 8, 128, 16),
-              (10, 16, 128, 32),
-              (10, 32, 64, 32),
-              (10, 32, 64, 64),
-              (10, 64, 32, 64),
-              (10, 64, 16, 64),
-              (10, 64, 8, 64),
-              (10, 128, 16, 64),
-              (10, 128, 32, 64),
-              (10, 96, 64, 32),
-              (10, 40, 128, 16),
-              (10, 16, 128, 16)
-             ]
+workloads2 = [(workload[0] * 10, *workload[1:]) for workload in workloads1] # 10 x 128 x 128
+workloads3 = [(workload[0], workload[1], workload[2] * 2, workload[3]) for workload in workloads1] # 1 x 256 x 256
+workloads4 = [(workload[0] * 10, workload[1], workload[2] * 2, workload[3]) for workload in workloads1] # 10 x 256 x 256
 
 wino_times = []
 direct_times = []
 device = "llvm"
-workloads = workloads2
+workloads = workloads1
 
 for workload in workloads:
     times = test_components(*workload, 3, 1, 1, device)
