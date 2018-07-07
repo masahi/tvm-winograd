@@ -101,7 +101,7 @@ def decl_U(data, kernel, stride, padding, out_dtype):
     G = const_array(G_data, 'G')
     r_kh = tvm.reduce_axis((0, KH), 'r_kh')
     r_kw = tvm.reduce_axis((0, KW), 'r_kw')
-    U = tvm.compute((K // bna, C // bnb, alpha, alpha, bna, bnb), lambda k, c, eps, nu, kk, cc:
+    U = tvm.compute((C // bnb, K // bna, alpha, alpha, bna, bnb), lambda c, k, eps, nu, cc, kk:
                     tvm.sum(kernel[k * bna + kk][c * bnb + cc][r_kh][r_kw] * G[eps][r_kh] * G[nu][r_kw],
                             axis=[r_kh, r_kw]), name='U')
     outs = [U]
@@ -110,9 +110,9 @@ def decl_U(data, kernel, stride, padding, out_dtype):
     U = op.output(0)
     kernel, G = s[U].op.input_tensors
     s[G].compute_inline()
-    k, c, eps, nu, kk, cc = s[U].op.axis
+    c, k, eps, nu, cc, kk = s[U].op.axis
     r_kh, r_kw = s[U].op.reduce_axis
-    s[U].reorder(k, c, kk, cc, eps, nu, r_kh, r_kw)
+    s[U].reorder(c, k, cc, kk, eps, nu, r_kh, r_kw)
     _ = [s[U].unroll(x) for x in [eps, nu, r_kh, r_kw]]
     kk = s[U].fuse(kk, cc)
     s[U].vectorize(kk)
@@ -155,8 +155,8 @@ def decl_V(data, kernel,  stride, padding, out_dtype):
     assert K % bna == 0 and P_round % bnb == 0
 
     data_pad = pad(data, (0, 0, HPAD, WPAD), name="data_pad")    
-    input_tile = tvm.compute((C // bna, P_round // bnb, alpha, alpha, bnb, bna),
-                             lambda c, b, eps, nu, cc, bb:
+    input_tile = tvm.compute((P_round // bnb, C // bna, alpha, alpha, bnb, bna),
+                             lambda b, c, eps, nu, bb, cc:
                              tvm.select(b * bnb + bb < P,\
                              data_pad[(b*bnb+bb) // (nH*nW)][c*bna + cc][(b*bnb+bb) // nW % nH * m + eps]\
                              [(b*bnb+bb) % nW * m + nu], tvm.const(0, data_pad.dtype)),
@@ -166,8 +166,8 @@ def decl_V(data, kernel,  stride, padding, out_dtype):
     B = const_array(B_data, 'B')
     r_eps = tvm.reduce_axis((0, alpha), 'r_eps')
     r_nu = tvm.reduce_axis((0, alpha), 'r_nu')
-    V = tvm.compute((C // bna, P_round // bnb, alpha, alpha, bna, bnb), lambda c,b, eps, nu, cc, bb:
-                    tvm.sum(input_tile[c][b][r_eps][r_nu][cc][bb] * B[r_eps][eps] * B[r_nu][nu],
+    V = tvm.compute((P_round // bnb, C // bna, alpha, alpha, bnb, bna), lambda b, c, eps, nu, bb, cc:
+                    tvm.sum(input_tile[b][c][r_eps][r_nu][bb][cc] * B[r_eps][eps] * B[r_nu][nu],
                             axis=[r_eps, r_nu]), name='V')
     outs = [V]
     s = tvm.create_schedule([x.op for x in outs])
@@ -177,9 +177,9 @@ def decl_V(data, kernel,  stride, padding, out_dtype):
     data_pad = s[d].op.input_tensors[0]
     s[data_pad].compute_inline()
     s[B].compute_inline()
-    c, b, eps, nu, cc, bb = s[V].op.axis
+    b, c, eps, nu, bb, cc = s[V].op.axis
     r_eps, r_nu = s[V].op.reduce_axis
-    s[V].reorder(c, b, cc, bb, eps, nu, r_nu, r_eps)
+    s[V].reorder(b, c, bb, cc, eps, nu, r_nu, r_eps)
     # _ = [s[V].unroll(x) for x in [eps, nu, r_eps, r_nu]]
     bb = s[V].fuse(bb, cc)
     s[V].vectorize(bb)
@@ -552,15 +552,15 @@ def test_components(batch, in_channel, in_size, num_filter, kernel, stride, padd
 
     with tvm.build_config(auto_unroll_max_step=500,
                           unroll_explicit=True):
-        # func_kernel_transform = tvm.build(s_U, [W, U_out], device)
-        # func_kernel_transform(w, u)
-        # timer = func_kernel_transform.time_evaluator(func_kernel_transform.entry_name, ctx, number=num_runs)
-        # times["U"] = timer(w, u).mean * 1000
+        func_kernel_transform = tvm.build(s_U, [W, U_out], device)
+        func_kernel_transform(w, u)
+        timer = func_kernel_transform.time_evaluator(func_kernel_transform.entry_name, ctx, number=num_runs)
+        times["U"] = timer(w, u).mean * 1000
         
-        # func_input_transform = tvm.build(s_V, [A, V_out], device)
-        # func_input_transform(a, v)
-        # timer = func_input_transform.time_evaluator(func_input_transform.entry_name, ctx, number=num_runs)
-        # times["V"] = timer(a, v).mean * 1000
+        func_input_transform = tvm.build(s_V, [A, V_out], device)
+        func_input_transform(a, v)
+        timer = func_input_transform.time_evaluator(func_input_transform.entry_name, ctx, number=num_runs)
+        times["V"] = timer(a, v).mean * 1000
 
         func_batch_mm = tvm.build(s_M, [U, V, M_out], device)
         #print(tvm.lower(s_M, [U, V, M_out], simple_mode=True))        
@@ -568,7 +568,7 @@ def test_components(batch, in_channel, in_size, num_filter, kernel, stride, padd
         
         timer = func_batch_mm.time_evaluator(func_batch_mm.entry_name, ctx, number=num_runs)
         times["M"] = timer(u, v, m).mean * 1000
-        print(tvm.lower(s_M, [A, W, U, V, M], simple_mode=True))
+        #print(tvm.lower(s_M, [A, W, U, V, M], simple_mode=True))
 
         func_inverse_transform = tvm.build(s_output, [M, output_out], device)
         func_inverse_transform(m, output_tvm)
@@ -576,7 +576,7 @@ def test_components(batch, in_channel, in_size, num_filter, kernel, stride, padd
         times["output"] = timer(m, output_tvm).mean * 1000
         #print(tvm.lower(s_output, [A, W, M, output], simple_mode=True))
         
-        #np.testing.assert_allclose(nchwc_to_nchw(output_tvm.asnumpy()), b_np, rtol=1e-5)
+        np.testing.assert_allclose(nchwc_to_nchw(output_tvm.asnumpy()), b_np, rtol=1e-5)
         
     return times
 
