@@ -179,16 +179,17 @@ def decl_V(data, kernel,  stride, padding, out_dtype):
     s[B].compute_inline()
     b, c, eps, nu, bb, cc = s[V].op.axis
     r_eps, r_nu = s[V].op.reduce_axis
-    s[V].reorder(b, c, bb, cc, eps, nu, r_nu, r_eps)
-    # _ = [s[V].unroll(x) for x in [eps, nu, r_eps, r_nu]]
-    bb = s[V].fuse(bb, cc)
-    s[V].vectorize(bb)
+    s[V].reorder(b, c, eps, nu, r_nu, r_eps, bb, cc)
+    s[V].vectorize(cc)
+    _ = [s[V].unroll(x) for x in [eps, nu, r_eps, r_nu]]
     fused = s[V].fuse(b, c)
     s[V].parallel(fused)
+
     s[d].compute_at(s[V], fused)
     b, c, eps, nu, bb, cc = s[d].op.axis
     s[d].unroll(cc)
     s[d].unroll(bb)
+
     return V, s
 
 def decl_M(data, kernel, U, V, stride, padding, out_dtype):
@@ -417,16 +418,16 @@ def schedule_winograd(outs):
     s[B].compute_inline()
     b, c, eps, nu, bb, cc = s[V].op.axis
     r_eps, r_nu = s[V].op.reduce_axis
-    s[V].reorder(b, c, bb, cc, eps, nu, r_nu, r_eps)
-    # _ = [s[V].unroll(x) for x in [eps, nu, r_eps, r_nu]]
-    bb = s[V].fuse(bb, cc)
-    s[V].vectorize(bb)
+    s[V].reorder(b, c, eps, nu, r_nu, r_eps, bb, cc)
+    s[V].vectorize(cc)
+    _ = [s[V].unroll(x) for x in [eps, nu, r_eps, r_nu]]
     fused = s[V].fuse(b, c)
     s[V].parallel(fused)
+
     s[d].compute_at(s[V], fused)
     b, c, eps, nu, bb, cc = s[d].op.axis
-    s[d].unroll(bb)
     s[d].unroll(cc)
+    s[d].unroll(bb)
 
     # batch gemm
     b, k, eps, nu, bb, kk = s[M].op.axis
@@ -545,9 +546,10 @@ def test_components(batch, in_channel, in_size, num_filter, kernel, stride, padd
         func_input_transform(a, v)
         timer = func_input_transform.time_evaluator(func_input_transform.entry_name, ctx, number=num_runs)
         times["V"] = timer(a, v).mean * 1000
-
+        #print(tvm.lower(s_V, [A, V_out], simple_mode=True))
+        
         func_batch_mm = tvm.build(s_M, [U, V, M_out], device)
-        #print(tvm.lower(s_M, [U, V, M_out], simple_mode=True))        
+        #print(tvm.lower(s_M, [U, V, M_out], simple_mode=True))
         func_batch_mm(u, v, m)
         
         timer = func_batch_mm.time_evaluator(func_batch_mm.entry_name, ctx, number=num_runs)
@@ -643,19 +645,19 @@ workloads1 = [(1, 128, 122, 128),
              (1, 256, 14, 256),
             ]
 
-workloads2 = [(1, 32, 128, 16),
-              (1, 16, 128, 8),
-              (1, 8, 128, 16),
-              (1, 16, 128, 32),
-              (1, 32, 64, 32),
-              (1, 32, 64, 64),
-              (1, 64, 32, 64),
-              (1, 64, 16, 64),
-              (1, 64, 8, 64),
-              (1, 128, 16, 64),
-              (1, 128, 32, 64),
-              (1, 96, 64, 32),
-              (1, 40, 128, 16),
+workloads2 = [# (1, 32, 128, 16),
+              # (1, 16, 128, 8),
+              # (1, 8, 128, 16),
+              # (1, 16, 128, 32),
+              # (1, 32, 64, 32),
+              # (1, 32, 64, 64),
+              # (1, 64, 32, 64),
+              # (1, 64, 16, 64),
+              # (1, 64, 8, 64),
+              # (1, 128, 16, 64),
+              # (1, 128, 32, 64),
+              # (1, 96, 64, 32),
+              # (1, 40, 128, 16),
               (1, 16, 128, 16)
              ]
 
