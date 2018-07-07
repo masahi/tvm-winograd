@@ -155,8 +155,8 @@ def decl_V(data, kernel,  stride, padding, out_dtype):
     assert K % bna == 0 and P_round % bnb == 0
 
     data_pad = pad(data, (0, 0, HPAD, WPAD), name="data_pad")    
-    input_tile = tvm.compute((P_round // bnb, C // bna, alpha, alpha, bnb, bna),
-                             lambda b, c, eps, nu, bb, cc:
+    input_tile = tvm.compute((C // bna, P_round // bnb, alpha, alpha, bnb, bna),
+                             lambda c, b, eps, nu, cc, bb:
                              tvm.select(b * bnb + bb < P,\
                              data_pad[(b*bnb+bb) // (nH*nW)][c*bna + cc][(b*bnb+bb) // nW % nH * m + eps]\
                              [(b*bnb+bb) % nW * m + nu], tvm.const(0, data_pad.dtype)),
@@ -166,8 +166,8 @@ def decl_V(data, kernel,  stride, padding, out_dtype):
     B = const_array(B_data, 'B')
     r_eps = tvm.reduce_axis((0, alpha), 'r_eps')
     r_nu = tvm.reduce_axis((0, alpha), 'r_nu')
-    V = tvm.compute((P_round // bnb, C // bna, alpha, alpha, bnb, bna), lambda b, c, eps, nu, bb, cc:
-                    tvm.sum(input_tile[b][c][r_eps][r_nu][bb][cc] * B[r_eps][eps] * B[r_nu][nu],
+    V = tvm.compute((C // bna, P_round // bnb, alpha, alpha, bna, bnb), lambda c,b, eps, nu, cc, bb:
+                    tvm.sum(input_tile[c][b][r_eps][r_nu][cc][bb] * B[r_eps][eps] * B[r_nu][nu],
                             axis=[r_eps, r_nu]), name='V')
     outs = [V]
     s = tvm.create_schedule([x.op for x in outs])
@@ -177,20 +177,19 @@ def decl_V(data, kernel,  stride, padding, out_dtype):
     data_pad = s[d].op.input_tensors[0]
     s[data_pad].compute_inline()
     s[B].compute_inline()
-    b, c, eps, nu, bb, cc = s[V].op.axis
+    c, b, eps, nu, cc, bb = s[V].op.axis
     r_eps, r_nu = s[V].op.reduce_axis
-    s[V].reorder(b, c, bb, cc, eps, nu, r_nu, r_eps)
+    s[V].reorder(c, b, cc, bb, eps, nu, r_nu, r_eps)
     # _ = [s[V].unroll(x) for x in [eps, nu, r_eps, r_nu]]
     bb = s[V].fuse(bb, cc)
     s[V].vectorize(bb)
     fused = s[V].fuse(b, c)
     s[V].parallel(fused)
     s[d].compute_at(s[V], fused)
-    b, c, eps, nu, bb, cc = s[d].op.axis
-    s[d].unroll(bb)
+    b, c, eps, nu, cc, bb = s[d].op.axis
     s[d].unroll(cc)
+    s[d].unroll(bb)
     return V, s
-    
 
 def decl_M(data, kernel, U, V, stride, padding, out_dtype):
     """declare winograd fast convolution F(2x2, 3x3) for conv2d"""
@@ -213,37 +212,34 @@ def decl_M(data, kernel, U, V, stride, padding, out_dtype):
     P = N * nH * nW
 
     bna, bnb = 8, 8
-    if data.dtype == 'float16':
-        bnb *= 2
     P_round = (P + bnb - 1) // bnb * bnb
     assert K % bna == 0 and P_round % bnb == 0
 
     # batch gemm
     c = tvm.reduce_axis((0, C), name='c')
     M = tvm.compute((K // bna, P_round //bnb, alpha, alpha, bna, bnb), lambda k, b, eps, nu, kk, bb:
-                    tvm.sum(U[k][c // bnb][eps][nu][kk][c % bnb] *
-                            V[b][c // bna][eps][nu][bb][c % bna], axis=c), name='M')
+                    tvm.sum(U[k][c // bna][eps][nu][kk][c % bna] *
+                            V[c // bna][b][eps][nu][c % bna][bb], axis=c), name='M')
 
     outs = [M]
     s = tvm.create_schedule([x.op for x in outs])
     op = outs[0].op
     M = op.output(0)
-    bna, bnb = 8, 8
     k, b, eps, nu, kk, bb = s[M].op.axis
     c = s[M].op.reduce_axis[0]
 
     #MM = s.cache_write(M, 'global')
-    yo, xo, yi, xi = k, b, kk, bb
-    fused = s[M].fuse(yo, xo, eps)
+    #bo, bi = s[M].split(b, factor=8)
+    fused = s[M].fuse(k, b, eps, nu)
     s[M].parallel(fused)
-    #s[MM].compute_at(s[M], fused)
-    co, ci = s[M].split(c, factor=4)
-    s[M].reorder(co, yi, ci, xi)
+    # #s[MM].compute_at(s[M], fused)
+    co, ci = s[M].split(c, factor=8)    
+    #s[M].reorder(b, eps, nu, co, kk, ci, bb, k)
+    s[M].reorder(co, kk, ci, bb)
     s[M].unroll(ci)
-    s[M].vectorize(xi)
+    s[M].vectorize(bb)
 
     return M, s
-
 
 def decl_output(data, kernel, M, stride, padding, out_dtype):
     """declare winograd fast convolution F(2x2, 3x3) for conv2d"""
@@ -351,8 +347,8 @@ def decl_winograd(data, kernel, stride, padding, out_dtype):
     assert K % bna == 0 and P_round % bnb == 0
 
     # pack input tile
-    input_tile = tvm.compute((P_round // bnb, C // bna, alpha, alpha, bnb, bna),
-                             lambda b, c, eps, nu, bb, cc:
+    input_tile = tvm.compute((C // bna, P_round // bnb, alpha, alpha, bna, bnb),
+                             lambda c, b, eps, nu, cc, bb:
                              tvm.select(b * bnb + bb < P,\
                              data_pad[(b*bnb+bb) // (nH*nW)][c*bna + cc][(b*bnb+bb) // nW % nH * m + eps]\
                              [(b*bnb+bb) % nW * m + nu], tvm.const(0, data_pad.dtype)),
@@ -370,15 +366,15 @@ def decl_winograd(data, kernel, stride, padding, out_dtype):
     B = const_array(B_data, 'B')
     r_eps = tvm.reduce_axis((0, alpha), 'r_eps')
     r_nu = tvm.reduce_axis((0, alpha), 'r_nu')
-    V = tvm.compute((P_round // bnb, C // bna, alpha, alpha, bnb, bna), lambda b, c, eps, nu, bb, cc:
-                    tvm.sum(input_tile[b][c][r_eps][r_nu][bb][cc] * B[r_eps][eps] * B[r_nu][nu],
+    V = tvm.compute((C // bna, P_round // bnb, alpha, alpha, bnb, bna), lambda c, b, eps, nu, cc, bb:
+                    tvm.sum(input_tile[c][b][r_eps][r_nu][cc][bb] * B[r_eps][eps] * B[r_nu][nu],
                             axis=[r_eps, r_nu]), name='V')
 
     # batch gemm
     c = tvm.reduce_axis((0, C), name='c')
     M = tvm.compute((K // bna, P_round //bnb, alpha, alpha, bna, bnb), lambda k, b, eps, nu, kk, bb:
                     tvm.sum(U[k][c // bnb][eps][nu][kk][c % bnb] *
-                            V[b][c // bna][eps][nu][bb][c % bna], axis=c), name='M')
+                            V[c // bna][b][eps][nu][c % bna][bb], axis=c), name='M')
     # print(U.shape, U.shape, V.shape) 
     # return M
     
@@ -494,9 +490,9 @@ def test_components(batch, in_channel, in_size, num_filter, kernel, stride, padd
 
     A = tvm.placeholder((batch, in_channel, in_height, in_width), name='A')
     W = tvm.placeholder((num_filter, in_channel, kernel, kernel), name='W')
-    U = tvm.placeholder((K // bna, C // bnb, alpha, alpha, bna, bnb), name='U')
-    V = tvm.placeholder((P_round // bnb, C // bna, alpha, alpha, bnb, bna), name='V')
-    M = tvm.placeholder((K // bnb, P_round // bna, alpha, alpha, bnb, bna ), name='M')
+    U = tvm.placeholder((K // bna, C // bna, alpha, alpha, bna, bna), name='U')
+    V = tvm.placeholder((C // bna, P_round // bnb, alpha, alpha, bna, bnb), name='V')
+    M = tvm.placeholder((K // bna, P_round // bnb, alpha, alpha, bna, bnb), name='M')
 
     output = tvm.placeholder((N, K, in_size, in_size), name='output')
 
@@ -515,8 +511,8 @@ def test_components(batch, in_channel, in_size, num_filter, kernel, stride, padd
         return a_np, w_np, b_np, c_np
 
     a_np, w_np, b_np, c_np = get_ref_data()
-    u_np = np.ones(util.get_const_tuple(U.shape), dtype=dtype)
-    v_np = np.ones(util.get_const_tuple(V.shape), dtype=dtype)
+    u_np = np.random.uniform(size=util.get_const_tuple(U.shape)).astype(dtype)
+    v_np = np.random.uniform(size=util.get_const_tuple(V.shape)).astype(dtype)
     m_np = np.zeros(util.get_const_tuple(M.shape), dtype=dtype)
     output_np = np.zeros(util.get_const_tuple(output.shape), dtype=dtype)
 
@@ -554,13 +550,13 @@ def test_components(batch, in_channel, in_size, num_filter, kernel, stride, padd
         
         timer = func_batch_mm.time_evaluator(func_batch_mm.entry_name, ctx, number=num_runs)
         times["M"] = timer(u, v, m).mean * 1000
-        #print(tvm.lower(s_M, [A, W, U, V, M], simple_mode=True))
+        print(tvm.lower(s_M, [A, W, U, V, M], simple_mode=True))
 
         func_inverse_transform = tvm.build(s_output, [M, output_out], device)
         func_inverse_transform(m, output_tvm)
         timer = func_inverse_transform.time_evaluator(func_inverse_transform.entry_name, ctx, number=num_runs)
         times["output"] = timer(m, output_tvm).mean * 1000
-        #print(tvm.lower(s_output, [A, W, M, output], simple_mode=True))
+        print(tvm.lower(s_output, [A, W, M, output], simple_mode=True))
         
         np.testing.assert_allclose(output_tvm.asnumpy(), b_np, rtol=1e-5)
         
@@ -697,15 +693,15 @@ for workload in workloads:
     times = test_components(*workload, 3, 1, 1, device)
     t_wino = test_winograd(*workload, 3, 1, 1, device)
     wino_times.append(t_wino * 1000)    
-#     t_direct = reference_direct(*workload, 3, 1, 1, device)
-#     direct_times.append(t_direct * 1000)
+    # t_direct = reference_direct(*workload, 3, 1, 1, device)
+    # direct_times.append(t_direct * 1000)
     
     print("Workload: ", workload)    
     for (k,v) in times.items():
         print("%s: %f" % (k, v))
     print("Total: %f" % np.sum(list(times.values())))
-#     print("Wino time: ", wino_times[-1])    
-#     print("Direct: %f\n" % direct_times[-1])
+    print("Wino time: ", wino_times[-1])    
+    # print("Direct: %f\n" % direct_times[-1])
 
 
 # generate_table(workloads, wino_times, direct_times)
