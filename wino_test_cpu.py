@@ -155,10 +155,10 @@ def decl_V(data, kernel,  stride, padding, out_dtype):
     s[B].compute_inline()
     b, c, eps, nu, bb, cc = s[V].op.axis
     r_eps, r_nu = s[V].op.reduce_axis
-    s[V].reorder(b, c, eps, nu, r_nu, r_eps, bb, cc)
+    s[V].reorder(b, c, bb, cc, eps, nu, r_nu, r_eps)
     s[V].vectorize(cc)
     _ = [s[V].unroll(x) for x in [eps, nu, r_eps, r_nu]]
-    fused = s[V].fuse(b, c)
+    fused = s[V].fuse(b, c, bb)
     s[V].parallel(fused)
 
     return V, s
@@ -460,10 +460,10 @@ def schedule_winograd_without_filter_transform(outs):
     s[B].compute_inline()
     b, c, eps, nu, bb, cc = s[V].op.axis
     r_eps, r_nu = s[V].op.reduce_axis
-    s[V].reorder(b, c, eps, nu, r_nu, r_eps, bb, cc)
+    s[V].reorder(b, c, bb, cc, eps, nu, r_nu, r_eps)
     s[V].vectorize(cc)
     _ = [s[V].unroll(x) for x in [eps, nu, r_eps, r_nu]]
-    fused = s[V].fuse(b, c)
+    fused = s[V].fuse(b, c, bb)
     s[V].parallel(fused)
 
     # batch gemm
