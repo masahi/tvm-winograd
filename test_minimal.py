@@ -3,22 +3,11 @@ import numpy as np
 
 def decl_V(A):
     temp_expr = {}
-    temp_expr[(0,0)] = A[0][0] - A[2][0]
-    temp_expr[(0,1)] = A[0][1] - A[2][1]
-    temp_expr[(0,2)] = A[0][2] - A[2][2]
-    temp_expr[(0,3)] = A[0][3] - A[2][3]
-    temp_expr[(1,0)] = A[1][0] + A[2][0]
-    temp_expr[(1,1)] = A[1][1] + A[2][1]
-    temp_expr[(1,2)] = A[1][2] + A[2][2]
-    temp_expr[(1,3)] = A[1][3] + A[2][3]
-    temp_expr[(2,0)] = A[2][0] - A[1][0]
-    temp_expr[(2,1)] = A[2][1] - A[1][1]
-    temp_expr[(2,2)] = A[2][2] - A[1][2]
-    temp_expr[(2,3)] = A[2][3] - A[1][3]
-    temp_expr[(3,0)] = A[1][0] - A[3][0]
-    temp_expr[(3,1)] = A[1][1] - A[3][1]
-    temp_expr[(3,2)] = A[1][2] - A[3][2]
-    temp_expr[(3,3)] = A[1][3] - A[3][3]
+    for j in range(4):
+        temp_expr[(0, j)] = A[0][j] - A[2][j]
+        temp_expr[(1, j)] = A[1][j] + A[2][j]
+        temp_expr[(2, j)] = A[2][j] - A[1][j]
+        temp_expr[(3, j)] = A[1][j] - A[3][j]
 
     def compute_temp(i, j):
         now = tvm.const(0.0, "float32")
@@ -32,22 +21,11 @@ def decl_V(A):
     T1 = tvm.compute((4,4), compute_temp, name="T1")
 
     v_expr = {}
-    v_expr[(0, 0)] = T1[0][0] - T1[0][2]
-    v_expr[(0, 1)] = T1[0][1] + T1[0][2]
-    v_expr[(0, 2)] = T1[0][2] - T1[0][1]
-    v_expr[(0, 3)] = T1[0][1] - T1[0][3]
-    v_expr[(1, 0)] = T1[1][0] - T1[1][2]
-    v_expr[(1, 1)] = T1[1][1] + T1[1][2]
-    v_expr[(1, 2)] = T1[1][2] - T1[1][1]
-    v_expr[(1, 3)] = T1[1][1] - T1[1][3]
-    v_expr[(2, 0)] = T1[2][0] - T1[2][2]
-    v_expr[(2, 1)] = T1[2][1] + T1[2][2]
-    v_expr[(2, 2)] = T1[2][2] - T1[2][1]
-    v_expr[(2, 3)] = T1[2][1] - T1[2][3]
-    v_expr[(3, 0)] = T1[3][0] - T1[3][2]
-    v_expr[(3, 1)] = T1[3][1] + T1[3][2]
-    v_expr[(3, 2)] = T1[3][2] - T1[3][1]
-    v_expr[(3, 3)] = T1[3][1] - T1[3][3]
+    for i in range(4):
+        v_expr[(i, 0)] = T1[i][0] - T1[i][2]
+        v_expr[(i, 1)] = T1[i][1] + T1[i][2]
+        v_expr[(i, 2)] = T1[i][2] - T1[i][1]
+        v_expr[(i, 3)] = T1[i][1] - T1[i][3]
 
     def compute_V(i, j):
         now = tvm.const(0.0, "float32")
