@@ -335,6 +335,15 @@ workloads = [(1, 128, 122, 128),
              (64, 128, 32, 128)
             ]
 
+vgg_workloads = [(1, 64, 224, 64), #relu, input and output transform slow
+                 (1, 64, 112, 128),#relu2
+                 (1, 128, 112, 128),
+                 (1, 128, 56, 256),
+                 (1, 256, 56, 256), #relu4
+                 (1, 256, 28, 512),
+                 (1, 512, 28, 512), # relu6
+                 (1, 512, 14, 512)] # relu7
+
 wino_times = []
 direct_times = []
 wino_nvptx_times = []
