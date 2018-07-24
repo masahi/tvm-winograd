@@ -144,7 +144,7 @@ def decl_V(data, kernel,  stride, padding, out_dtype):
     s[data_pad].compute_inline()
     
     b, c, eps, nu, bb, cc = s[V].op.axis
-    s[V].reorder(b, c, bb, cc, eps, nu)
+    s[V].reorder(b, c, bb, eps, nu, cc)
     s[V].vectorize(cc)
     _ = [s[V].unroll(x) for x in [eps, nu]]
 
@@ -152,11 +152,10 @@ def decl_V(data, kernel,  stride, padding, out_dtype):
     s[V].parallel(fused)
 
     b, c, eps, nu, bb, cc = s[temp].op.axis
-    s[temp].reorder(b, c, bb, cc, eps, nu)
+    s[temp].reorder(b, c, bb, eps, nu, cc)
     s[temp].vectorize(cc)
     _ = [s[temp].unroll(x) for x in [eps, nu]]
     s[temp].compute_at(s[V], fused)
-#    s[data_pad].compute_at(s[V], fused)
 
     return V, s
 
@@ -370,7 +369,7 @@ def schedule_winograd_without_filter_transform(outs):
     # transform image
     s[data_pad].compute_inline()    
     b, c, eps, nu, bb, cc = s[V].op.axis
-    s[V].reorder(b, c, bb, cc, eps, nu)
+    s[V].reorder(b, c, bb, eps, nu, cc)
     s[V].vectorize(cc)
     _ = [s[V].unroll(x) for x in [eps, nu]]
 
@@ -378,11 +377,10 @@ def schedule_winograd_without_filter_transform(outs):
     s[V].parallel(fused)
 
     b, c, eps, nu, bb, cc = s[temp].op.axis
-    s[temp].reorder(b, c, bb, cc, eps, nu)
+    s[temp].reorder(b, c, bb, eps, nu, cc)
     s[temp].vectorize(cc)
     _ = [s[temp].unroll(x) for x in [eps, nu]]
     s[temp].compute_at(s[V], fused)
-#    s[data_pad].compute_at(s[V], fused)
 
     # batch gemm
     b, k, eps, nu, bb, kk = s[M].op.axis
