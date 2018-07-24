@@ -114,7 +114,7 @@ def schedule(outs):
     return s
 
 A = tvm.placeholder((6, 6), name="A")
-M = tvm.placeholder((6, 6), name="A")
+M = tvm.placeholder((6, 6), name="M")
 device = "llvm"
 with tvm.target.create(device):
     V = decl_V(A)
