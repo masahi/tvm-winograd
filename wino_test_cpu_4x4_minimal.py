@@ -212,15 +212,6 @@ def decl_output(data, kernel, M, stride, padding, out_dtype):
 
     assert HSTR == 1 and WSTR == 1 and HPAD == 1 and WPAD == 1
 
-    A_data = np.array([
-        [1, 0, 0, 0],
-        [1, 1, 1, 1],
-        [1, -1, 1, -1],
-        [1, 2, 4, 8],
-        [1, -2, 4, -8],
-        [0, 0, 0, 1]
-    ], out_dtype)
-
     m = 4
     r = 3
     alpha = m + r - 1
@@ -228,30 +219,76 @@ def decl_output(data, kernel, M, stride, padding, out_dtype):
     P = N * nH * nW
     bna, bnb = 8, 8
 
-    # inverse transform
-    A = const_array(A_data, 'A')
-    r_eps = tvm.reduce_axis((0, alpha), 'r_eps')
-    r_nu = tvm.reduce_axis((0, alpha), 'r_nu')
-    output = tvm.compute((N, K // bna, H, W, bna), lambda n, k, h, w, kk: 
-                    tvm.sum(M[(n * nH * nW + (h//m) * nW + w//m)//bna][k][r_eps][r_nu][(n * nH * nW + (h//m) * nW + w//m)%bna][kk] * A[r_eps][h % m] * A[r_nu][w % m],
-                            axis=[r_eps, r_nu]), name='output')
+    def compute_temp(tile_index, k, eps, nu, kk):
+        b = tile_index // bnb
+        bb = tile_index % bnb
+        temp_expr = {}
+        for j in range(6):
+            t0 =  M[b][k][1][j][bb][kk] + M[b][k][2][j][bb][kk]
+            t1 =  M[b][k][3][j][bb][kk] + M[b][k][4][j][bb][kk]
+            t2 =  M[b][k][1][j][bb][kk] - M[b][k][2][j][bb][kk]
+            t3 =  M[b][k][3][j][bb][kk] - M[b][k][4][j][bb][kk]
+            temp_expr[(0, j)] = t0 + t1 + M[b][k][0][j][bb][kk]
+            temp_expr[(1, j)] = t2 + t3*2.0
+            temp_expr[(2, j)] = t0 + t1*4.0
+            temp_expr[(3, j)] = t2 + t3*8.0 + M[b][k][5][j][bb][kk]
+
+        now = tvm.const(0.0, "float32")
+        for ii in range(4):
+            for jj in range(6):
+                now = tvm.select(tvm.all(eps == ii, nu == jj),
+                                 temp_expr[(ii, jj)],
+                                 now)
+        return now
+
+    temp = tvm.compute((P, K // bna, m, alpha, bna), compute_temp, name="temp")
+
+    def compute_output(n, k, h, w, kk):
+        b = (n * nH * nW + (h//m) * nW + w//m)
+        eps = h%m
+        nu = w%m
+        output_expr = {}
+        for i in range(4):
+            t0 =  temp[b][k][i][1][kk] + temp[b][k][i][2][kk]
+            t1 =  temp[b][k][i][3][kk] + temp[b][k][i][4][kk]
+            t2 =  temp[b][k][i][1][kk] - temp[b][k][i][2][kk]
+            t3 =  temp[b][k][i][3][kk] - temp[b][k][i][4][kk]
+            output_expr[(i, 0)] = t0 + t1 + temp[b][k][i][0][kk]
+            output_expr[(i, 1)] = t2 + t3 * 2.0
+            output_expr[(i, 2)] = t0 + t1 * 4.0
+            output_expr[(i, 3)] = t2 + t3 * 8.0 + temp[b][k][i][5][kk]
+
+        now = tvm.const(0.0, "float32")
+        for ii in range(4):
+            for jj in range(4):
+                now = tvm.select(tvm.all(eps == ii, nu == jj),
+                                 output_expr[(ii, jj)],
+                                 now)
+        return now
+
+    output = tvm.compute((N, K // bna, H, W, bna), compute_output)
 
     outs = [output]
     s = tvm.create_schedule([x.op for x in outs])
     op = outs[0].op
     output = op.output(0)
-    _, A = s[output].op.input_tensors
-    s[A].compute_inline()
+    temp = s[output].op.input_tensors[0]
 
     n, k, h, w, kk = s[output].op.axis
-    r_eps, r_nu = s[output].op.reduce_axis    
-    ho, hi = s[output].split(h, factor=8)
-    wo, wi = s[output].split(w, factor=8)
-    s[output].reorder(n, k, ho, wo, hi, r_eps, r_nu, wi, kk)
+    ho, hi = s[output].split(h, factor=4)
+    wo, wi = s[output].split(w, factor=4)
+    s[output].reorder(n, k, ho, wo,  hi, wi, kk)
+    s[output].unroll(hi)
+    s[output].unroll(wi)
     s[output].vectorize(kk)
     fused = s[output].fuse(n, k, ho, wo) 
     s[output].parallel(fused)
-    _ = [s[output].unroll(x) for x in [r_eps, r_nu]]
+
+    b, k, eps, nu, kk = s[temp].op.axis
+    s[temp].unroll(eps)
+    s[temp].unroll(nu)
+    s[temp].vectorize(kk)
+    s[temp].compute_at(s[output], fused)
     
     return output, s
 
@@ -307,7 +344,60 @@ def decl_V_minimal(data_pad, P, C, alpha, bna, bnb, nH, nW, m):
 
     V = tvm.compute((P // bnb, C // bna, alpha, alpha, bnb, bna), compute_V)
     return V
-    
+
+def decl_output_minimal(M, N, K, H, W, P, alpha, bna, bnb, nH, nW, m):
+
+    def compute_temp(tile_index, k, eps, nu, kk):
+        b = tile_index // bnb
+        bb = tile_index % bnb
+        temp_expr = {}
+        for j in range(6):
+            t0 =  M[b][k][1][j][bb][kk] + M[b][k][2][j][bb][kk]
+            t1 =  M[b][k][3][j][bb][kk] + M[b][k][4][j][bb][kk]
+            t2 =  M[b][k][1][j][bb][kk] - M[b][k][2][j][bb][kk]
+            t3 =  M[b][k][3][j][bb][kk] - M[b][k][4][j][bb][kk]
+            temp_expr[(0, j)] = t0 + t1 + M[b][k][0][j][bb][kk]
+            temp_expr[(1, j)] = t2 + t3*2.0
+            temp_expr[(2, j)] = t0 + t1*4.0
+            temp_expr[(3, j)] = t2 + t3*8.0 + M[b][k][5][j][bb][kk]
+
+        now = tvm.const(0.0, "float32")
+        for ii in range(4):
+            for jj in range(6):
+                now = tvm.select(tvm.all(eps == ii, nu == jj),
+                                 temp_expr[(ii, jj)],
+                                 now)
+        return now
+
+    temp = tvm.compute((P, K // bna, m, alpha, bna), compute_temp, name="temp")
+
+    def compute_output(n, k, h, w, kk):
+        b = (n * nH * nW + (h//m) * nW + w//m)
+        eps = h%m
+        nu = w%m
+        output_expr = {}
+        for i in range(4):
+            t0 =  temp[b][k][i][1][kk] + temp[b][k][i][2][kk]
+            t1 =  temp[b][k][i][3][kk] + temp[b][k][i][4][kk]
+            t2 =  temp[b][k][i][1][kk] - temp[b][k][i][2][kk]
+            t3 =  temp[b][k][i][3][kk] - temp[b][k][i][4][kk]
+            output_expr[(i, 0)] = t0 + t1 + temp[b][k][i][0][kk]
+            output_expr[(i, 1)] = t2 + t3 * 2.0
+            output_expr[(i, 2)] = t0 + t1 * 4.0
+            output_expr[(i, 3)] = t2 + t3 * 8.0 + temp[b][k][i][5][kk]
+
+        now = tvm.const(0.0, "float32")
+        for ii in range(4):
+            for jj in range(4):
+                now = tvm.select(tvm.all(eps == ii, nu == jj),
+                                 output_expr[(ii, jj)],
+                                 now)
+        return now
+
+    output = tvm.compute((N, K // bna, H, W, bna), compute_output)
+
+    return output
+
 def decl_winograd_without_filter_transform(data, U, stride, padding, out_dtype):
     N, co, H, W, ci = [util.get_const_int(x) for x in data.shape]
     co, ko, _, _, ci, ki  = [util.get_const_int(x) for x in U.shape]
@@ -347,12 +437,7 @@ def decl_winograd_without_filter_transform(data, U, stride, padding, out_dtype):
                             U[c // bna][k][eps][nu][c % bna][kk], axis=c), name='M')
     
     # inverse transform
-    A = const_array(A_data, 'A')
-    r_eps = tvm.reduce_axis((0, alpha), 'r_eps')
-    r_nu = tvm.reduce_axis((0, alpha), 'r_nu')
-    output = tvm.compute((N, K // bna, H, W, bna), lambda n, k, h, w, kk: 
-                    tvm.sum(M[(n * nH * nW + (h//m) * nW + w//m)//bna][k][r_eps][r_nu][(n * nH * nW + (h//m) * nW + w//m)%bna][kk] * A[r_eps][h % m] * A[r_nu][w % m],
-                            axis=[r_eps, r_nu]), name='output')
+    output = decl_output_minimal(M, N, K, H, W, P, alpha, bna, bnb, nH, nW, m)
     
     return output
 
@@ -360,10 +445,11 @@ def schedule_winograd_without_filter_transform(outs):
     s = tvm.create_schedule([x.op for x in outs])
     op = outs[0].op
     output = op.output(0)
-    M, A = s[output].op.input_tensors
+    temp_output_transform = s[output].op.input_tensors[0]
+    M = s[temp_output_transform].op.input_tensors[0]
     V, U = s[M].op.input_tensors
-    temp = s[V].op.input_tensors[0]
-    data_pad = s[temp].op.input_tensors[0]
+    temp_input_transform = s[V].op.input_tensors[0]
+    data_pad = s[temp_input_transform].op.input_tensors[0]
     data = s[data_pad].op.input_tensors[0]
 
     # transform image
@@ -376,11 +462,11 @@ def schedule_winograd_without_filter_transform(outs):
     fused = s[V].fuse(b, c, bb)
     s[V].parallel(fused)
 
-    b, c, eps, nu, bb, cc = s[temp].op.axis
-    s[temp].reorder(b, c, bb, eps, nu, cc)
-    s[temp].vectorize(cc)
-    _ = [s[temp].unroll(x) for x in [eps, nu]]
-    s[temp].compute_at(s[V], fused)
+    b, c, eps, nu, bb, cc = s[temp_input_transform].op.axis
+    s[temp_input_transform].reorder(b, c, bb, eps, nu, cc)
+    s[temp_input_transform].vectorize(cc)
+    _ = [s[temp_input_transform].unroll(x) for x in [eps, nu]]
+    s[temp_input_transform].compute_at(s[V], fused)
 
     # batch gemm
     b, k, eps, nu, bb, kk = s[M].op.axis
@@ -392,17 +478,22 @@ def schedule_winograd_without_filter_transform(outs):
     s[M].unroll(ci)
     s[M].vectorize(kk)
     
-#     # inverse transform
-    s[A].compute_inline()
+    # inverse transform
     n, k, h, w, kk = s[output].op.axis
-    r_eps, r_nu = s[output].op.reduce_axis    
-    ho, hi = s[output].split(h, factor=8)
-    wo, wi = s[output].split(w, factor=8)
-    s[output].reorder(n, k, ho, wo, hi, r_eps, r_nu, wi, kk)
+    ho, hi = s[output].split(h, factor=4)
+    wo, wi = s[output].split(w, factor=4)
+    s[output].reorder(n, k, ho, wo,  hi, wi, kk)
+    s[output].unroll(hi)
+    s[output].unroll(wi)
     s[output].vectorize(kk)
     fused = s[output].fuse(n, k, ho, wo) 
     s[output].parallel(fused)
-    _ = [s[output].unroll(x) for x in [r_eps, r_nu]]
+
+    b, k, eps, nu, kk = s[temp_output_transform].op.axis
+    s[temp_output_transform].unroll(eps)
+    s[temp_output_transform].unroll(nu)
+    s[temp_output_transform].vectorize(kk)
+    s[temp_output_transform].compute_at(s[output], fused)
 
     return s
 
@@ -484,7 +575,7 @@ def test_components(batch, in_channel, in_size, num_filter, kernel, stride, padd
     v = tvm.nd.array(v_np, ctx)
     m = tvm.nd.array(m_np, ctx)
     output_tvm = tvm.nd.array(output_np, ctx)        
-    num_runs = 100
+    num_runs = 1000
     times = {}
 
     with tvm.build_config(auto_unroll_max_step=500,
@@ -502,7 +593,6 @@ def test_components(batch, in_channel, in_size, num_filter, kernel, stride, padd
         timer = func_batch_mm.time_evaluator(func_batch_mm.entry_name, ctx, number=num_runs)
         times["M"] = timer(u, v, m).mean * 1000
         #print(tvm.lower(s_M, [A, W, U, V, M], simple_mode=True))
-
         func_inverse_transform = tvm.build(s_output, [M, output_out], device)
         func_inverse_transform(m, output_tvm)
         timer = func_inverse_transform.time_evaluator(func_inverse_transform.entry_name, ctx, number=num_runs)
@@ -553,7 +643,7 @@ def test_winograd_without_filter_transform(batch, in_channel, in_size, num_filte
         func = tvm.build(s, [A, U, B], device)
         func(a, u, b)
         #print(tvm.lower(s, [A, U, B], simple_mode=True))
-        num_runs = 100
+        num_runs = 1000
         timer = func.time_evaluator(func.entry_name, ctx, number=num_runs)
         np.testing.assert_allclose(nchwc_to_nchw(b.asnumpy()), b_np, rtol=1e-5)
         return timer(a, u, b).mean
@@ -603,6 +693,5 @@ for workload in workloads:
     print("Total: %f" % np.sum(list(times.values())))
     print("Wino time: ", wino_times[-1])    
     print("Direct: %f\n" % direct_times[-1])
-
 
 generate_table(workloads, wino_times, direct_times)

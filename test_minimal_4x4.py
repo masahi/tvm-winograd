@@ -95,9 +95,9 @@ def decl_output(M):
                                  now)
         return now
 
-    V = tvm.compute((4,4), compute_output)
+    output = tvm.compute((4,4), compute_output)
 
-    return V
+    return output
 
 def schedule(outs):
     s = tvm.create_schedule([x.op for x in outs])
