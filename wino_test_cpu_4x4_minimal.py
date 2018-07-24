@@ -40,27 +40,11 @@ def reference_direct(batch, in_channel, in_size, num_filter, kernel, stride, pad
     with tvm.build_config(auto_unroll_max_step=500,
                           unroll_explicit=True):
         func = tvm.build(s1, [A, W, B], device)
-        #print(tvm.lower(s1, [A, W, B], simple_mode=True))
         func(a, w, b)
         np.testing.assert_allclose(b.asnumpy(), b_np, rtol=1e-5)
         num_runs = 100
         timer = func.time_evaluator(func.entry_name, ctx, number=num_runs)
         return timer(a, w, b).mean
-
-def const_array(data, name):
-    """ convert an const array to tvm tensor"""
-    row, col = data.shape
-    dtype = str(data.dtype)
-
-    def select_array(i, j):
-        now = tvm.const(0.0, dtype)
-        for ii in range(row):
-            for jj in range(col):
-                now = tvm.select(tvm.all(i % row == ii, j % col == jj),
-                                 tvm.const(data[ii][jj], dtype),
-                                 now)
-        return now
-    return tvm.compute(data.shape, select_array, name=name)
 
 def decl_V(data, kernel,  stride, padding, out_dtype):
     """declare winograd fast convolution F(2x2, 3x3) for conv2d"""
@@ -412,15 +396,6 @@ def decl_winograd_without_filter_transform(data, U, stride, padding, out_dtype):
     assert HSTR == 1 and WSTR == 1 and HPAD == 1 and WPAD == 1
     data_pad = pad(data, (0, 0, HPAD, WPAD, 0), name="data_pad")
 
-    A_data = np.array([
-        [1, 0, 0, 0],
-        [1, 1, 1, 1],
-        [1, -1, 1, -1],
-        [1, 2, 4, 8],
-        [1, -2, 4, -8],
-        [0, 0, 0, 1]
-    ], out_dtype)
-    
     m = 4
     r = 3
     alpha = m + r - 1
