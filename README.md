@@ -1,6 +1,10 @@
 Results below are obtained before AutoTVM was introduced.
+
 When AutoTVM was merged, the TVM Direct convolution schedule was replaced with a completely new one.
+
 So the "TVM Direct" results below do not represent current performance of TVM. It should be much better now.
+
+<br/>
 
 All numbers in msec.
 
